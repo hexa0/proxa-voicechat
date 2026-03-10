@@ -1,0 +1,4 @@
+[package]
+name = "proxa-protocol"
+version.workspace = true
+edition.workspace = true

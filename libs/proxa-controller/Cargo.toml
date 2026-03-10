@@ -1,0 +1,4 @@
+[package]
+name = "proxa-controller"
+version.workspace = true
+edition.workspace = true

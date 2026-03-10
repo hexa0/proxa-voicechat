@@ -1,0 +1,4 @@
+[package]
+name = "proxa-controller-tray-app"
+version.workspace = true
+edition.workspace = true

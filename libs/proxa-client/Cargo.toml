@@ -1,0 +1,4 @@
+[package]
+name = "proxa-client"
+version.workspace = true
+edition.workspace = true

@@ -1,0 +1,4 @@
+[package]
+name = "proxa-relay-server"
+version.workspace = true
+edition.workspace = true

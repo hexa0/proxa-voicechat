@@ -1,12 +1,25 @@
-[package]
-name = "proxa"
+[workspace]
+resolver = "2"
+members = ["apps/*", "libs/*"]
+
+[workspace.package]
 version = "0.0.0"
 edition = "2024"
+authors = ["hexa0"]
 
-[dependencies]
-# TODO: switch to mainline cpal when this is merged
-cpal = { git = "https://github.com/Decodetalkers/cpal", branch = "pipewire", version = "0.18.0" }
+[workspace.dependencies]
+# audio backend
+# this is temp until pipewire support is published on cargo
+cpal = { git = "https://github.com/RustAudio/cpal", version = "0.18.0" }
+# rnnoise bindings
 nnnoiseless = "0.5.2"
+# i mean this is is a bit obvious it's just the audio codec lol
 opus = "0.3.1"
+# QUIC networking
+quinn = "0.11.9"
+# async
 tokio = "1.49.0"
+# also obvious
 tray-icon = "0.21.3"
+# also also obvious
+env_logger = "0.11.9"
