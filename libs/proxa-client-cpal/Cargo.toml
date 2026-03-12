@@ -2,3 +2,16 @@
 name = "proxa-client-cpal"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+proxa-client = { path = "../proxa-client" }
+anyhow = "1"
+opus.workspace = true
+parking_lot = "0.12"
+log.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { workspace = true, features = ["pipewire"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+cpal = { workspace = true }

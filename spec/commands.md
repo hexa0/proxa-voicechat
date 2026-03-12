@@ -1,7 +1,7 @@
 # THIS DOCUMENT IS UNFINISHED!!!
 
 this document defines the control protocol\
-this protocol defines how to control the voice chat via UDP networked commands\
+this protocol defines how to control the voice chat via UDP networked commands, this is for languages that do not have bindings to the library or situations where you cannot use bindings like code compiled to be ran inside of an emulator\
 this protocol is unimplemented in the curreent state, do not rely on this protocol yet\
 additionally when this is implemented this document may not correctly reflect the spec until the code is finalized
 
@@ -63,7 +63,7 @@ additionally when this is implemented this document may not correctly reflect th
     - **RY (f32)**
     - **RZ (f32)**
 - 5: Set Listener Rolloff Settings - **curveType (u8)** - **rolloffStart (f32)** - **rolloffEnd (f32)**
-    <!-- Speaker Related Events 10-19 -->
+      <!-- Speaker Related Events 10-19 -->
 - 10: Set Speaker Position
     - **speakerId (u16)**
     - **X (f32)**

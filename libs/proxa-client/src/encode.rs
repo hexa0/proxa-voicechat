@@ -1,0 +1,317 @@
+use crate::aec3::AecWrapper;
+use crate::dfn3::{DfEngine, load_dfn3_engine_internal};
+use crate::types::{DenoiseMethod, SILENCE_BITRATE, VOICE_THRESHOLD};
+use anyhow::Result;
+use parking_lot::Mutex;
+use proxa_protocol::ClientMessage;
+use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+
+pub struct EncodeState {
+    pub mic_buffer: Vec<f32>,
+    pub far_end_buffer: Vec<f32>,
+    pub encoder: opus::Encoder,
+    pub channels: opus::Channels,
+    pub samples_per_frame: usize,
+    pub simulated_loss: f32,
+    pub denoise_method: DenoiseMethod,
+    pub aec_enabled: bool,
+    pub rnnoise_state_left: Option<nnnoiseless::DenoiseState<'static>>,
+    pub rnnoise_state_right: Option<nnnoiseless::DenoiseState<'static>>,
+    pub aec: Option<AecWrapper>,
+    pub dfn3_engine: Option<DfEngine>,
+    pub dfn3_model_path: Option<std::path::PathBuf>,
+    pub dfn3_loading: bool,
+    pub next_send_sequence: u32,
+    pub volume: f32,
+    pub target_bitrate: i32,
+    pub last_voice_time: std::time::Instant,
+    pub is_throttled: bool,
+    pub actual_loss_perc: i32,
+}
+
+impl EncodeState {
+    pub fn load_dfn3_models(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref().to_path_buf();
+        if self.dfn3_model_path.as_ref() == Some(&path) && self.dfn3_engine.is_some() {
+            return Ok(());
+        }
+        self.dfn3_model_path = Some(path);
+        self.dfn3_engine = None;
+        Ok(())
+    }
+
+    pub fn process_aec(&mut self, frame: &mut [f32]) {
+        if !self.aec_enabled {
+            return;
+        }
+
+        let channels = if self.channels == opus::Channels::Stereo {
+            2
+        } else {
+            1
+        };
+        let render_samples_per_aec_block = 480 * channels;
+        let capture_samples_per_aec_block = 480 * channels;
+
+        let drain_len = self
+            .far_end_buffer
+            .len()
+            .min(render_samples_per_aec_block * 2);
+        let render_data: Vec<f32> = self.far_end_buffer.drain(..drain_len).collect();
+
+        if let Some(ref mut aec) = self.aec {
+            for (c_block, r_block) in frame
+                .chunks_mut(capture_samples_per_aec_block)
+                .zip(render_data.chunks(render_samples_per_aec_block))
+            {
+                if c_block.len() == capture_samples_per_aec_block
+                    && r_block.len() == render_samples_per_aec_block
+                {
+                    let mut capture_mono = [0.0f32; 480];
+                    let mut render_mono = [0.0f32; 480];
+
+                    if channels == 2 {
+                        for i in 0..480 {
+                            capture_mono[i] = (c_block[i * 2] + c_block[i * 2 + 1]) / 2.0;
+                            render_mono[i] = (r_block[i * 2] + r_block[i * 2 + 1]) / 2.0;
+                        }
+                    } else {
+                        capture_mono.copy_from_slice(c_block);
+                        render_mono.copy_from_slice(r_block);
+                    }
+
+                    let mut out = [0.0f32; 480];
+                    let _ = aec.process(&capture_mono, Some(&render_mono), false, &mut out);
+
+                    if channels == 2 {
+                        for i in 0..480 {
+                            c_block[i * 2] = out[i];
+                            c_block[i * 2 + 1] = out[i];
+                        }
+                    } else {
+                        c_block.copy_from_slice(&out);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn process_denoise(
+        &mut self,
+        frame: &mut [f32],
+        encode_state_clone: &Arc<Mutex<EncodeState>>,
+    ) {
+        match self.denoise_method {
+            DenoiseMethod::RNNoise => self.process_rnnoise(frame),
+            DenoiseMethod::DFN3 => self.process_dfn3(frame, encode_state_clone),
+            DenoiseMethod::Off => {}
+        }
+    }
+
+    fn process_rnnoise(&mut self, frame: &mut [f32]) {
+        let channels = if self.channels == opus::Channels::Stereo {
+            2
+        } else {
+            1
+        };
+        if channels == 2 {
+            if let Some(mut d) = self.rnnoise_state_left.take() {
+                for chunk in frame.chunks_mut(480 * 2) {
+                    if chunk.len() == 480 * 2 {
+                        let mut mono = [0.0f32; 480];
+                        for i in 0..480 {
+                            mono[i] = (chunk[i * 2] + chunk[i * 2 + 1]) * 16384.0;
+                        }
+                        let mut out = [0.0f32; 480];
+                        d.process_frame(&mut out, &mono);
+                        for i in 0..480 {
+                            chunk[i * 2] = out[i] / 32768.0;
+                            chunk[i * 2 + 1] = out[i] / 32768.0;
+                        }
+                    }
+                }
+                self.rnnoise_state_left = Some(d);
+            }
+        } else {
+            if let Some(mut d) = self.rnnoise_state_left.take() {
+                for chunk in frame.chunks_mut(480) {
+                    if chunk.len() == 480 {
+                        for sample in chunk.iter_mut() {
+                            *sample *= 32768.0;
+                        }
+                        let mut out = [0.0f32; 480];
+                        let chunk_arr: &[f32; 480] = (&*chunk).try_into().unwrap();
+                        d.process_frame(&mut out, chunk_arr);
+                        for (i, sample) in chunk.iter_mut().enumerate() {
+                            *sample = out[i] / 32768.0;
+                        }
+                    }
+                }
+                self.rnnoise_state_left = Some(d);
+            }
+        }
+    }
+
+    fn process_dfn3(&mut self, frame: &mut [f32], encode_state_clone: &Arc<Mutex<EncodeState>>) {
+        let channels = if self.channels == opus::Channels::Stereo {
+            2
+        } else {
+            1
+        };
+
+        if self.dfn3_engine.is_none() && self.dfn3_model_path.is_some() && !self.dfn3_loading {
+            let path = self.dfn3_model_path.clone().unwrap();
+            let e_state = encode_state_clone.clone();
+            self.dfn3_loading = true;
+            tokio::task::spawn_blocking(move || {
+                log::info!("lazy loading DFN3 models in background...");
+                match load_dfn3_engine_internal(&path) {
+                    Ok(engine) => {
+                        let mut s = e_state.lock();
+                        s.dfn3_engine = Some(DfEngine(std::sync::Arc::new(
+                            parking_lot::Mutex::new(engine),
+                        )));
+                        s.dfn3_loading = false;
+                        log::info!("DFN3 AI engine loaded successfully in background");
+                    }
+                    Err(e) => {
+                        log::error!("failed to lazy load DFN3 models: {}", e);
+                        let mut s = e_state.lock();
+                        s.dfn3_loading = false;
+                        s.dfn3_model_path = None;
+                    }
+                }
+            });
+        }
+
+        if let Some(ref mut engine) = self.dfn3_engine {
+            let mut engine_lock = engine.0.lock();
+            let hop_size = engine_lock.hop_size;
+            for chunk in frame.chunks_mut(hop_size * channels) {
+                if chunk.len() == hop_size * channels {
+                    if channels == 2 {
+                        let mut left = vec![0.0f32; hop_size];
+                        for i in 0..hop_size {
+                            left[i] = (chunk[i * 2] + chunk[i * 2 + 1]) / 2.0;
+                        }
+                        let input = ndarray::Array2::from_shape_vec((1, hop_size), left).unwrap();
+                        let mut output = ndarray::Array2::zeros((1, hop_size));
+                        let _lsnr = engine_lock
+                            .process(input.view(), output.view_mut())
+                            .unwrap_or(0.0);
+                        let processed = output.row(0);
+                        for i in 0..hop_size {
+                            chunk[i * 2] = processed[i];
+                            chunk[i * 2 + 1] = processed[i];
+                        }
+                    } else {
+                        let input = ndarray::ArrayView2::from_shape((1, hop_size), chunk).unwrap();
+                        let mut output = ndarray::Array2::zeros((1, hop_size));
+                        let _lsnr = engine_lock.process(input, output.view_mut()).unwrap_or(0.0);
+                        chunk.copy_from_slice(output.row(0).as_slice().unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn handle_vad(
+        &mut self,
+        frame: &[f32],
+        report_tx: &Option<mpsc::UnboundedSender<ClientMessage>>,
+    ) -> bool {
+        let mut sum_sq = 0.0;
+        for &sample in frame {
+            sum_sq += sample * sample;
+        }
+        let vol = (sum_sq / frame.len() as f32).sqrt();
+        self.volume = vol;
+
+        if vol > VOICE_THRESHOLD {
+            self.last_voice_time = std::time::Instant::now();
+            if self.is_throttled {
+                let bitrate = self.target_bitrate;
+                let _ = self.encoder.set_bitrate(opus::Bitrate::Bits(bitrate));
+                let _ = self.encoder.set_inband_fec(true);
+                let loss_perc = self.actual_loss_perc;
+                let _ = self.encoder.set_packet_loss_perc(loss_perc);
+                self.is_throttled = false;
+                let _ = self.encoder.reset_state();
+                if let Some(tx) = report_tx {
+                    let _ = tx.send(ClientMessage::SetSilence(false));
+                }
+            }
+        } else if !self.is_throttled
+            && self.last_voice_time.elapsed() > std::time::Duration::from_millis(100)
+        {
+            let low_bitrate = self.target_bitrate.min(SILENCE_BITRATE);
+            let _ = self.encoder.set_bitrate(opus::Bitrate::Bits(low_bitrate));
+            let _ = self.encoder.set_inband_fec(false);
+            let _ = self.encoder.set_packet_loss_perc(0);
+            self.is_throttled = true;
+            if let Some(tx) = report_tx {
+                let _ = tx.send(ClientMessage::SetSilence(true));
+            }
+        }
+
+        self.is_throttled
+    }
+}
+
+pub async fn run_encode_task(
+    encode_state: Arc<Mutex<EncodeState>>,
+    mut mic_rx: mpsc::UnboundedReceiver<Vec<f32>>,
+    mut far_end_rx: mpsc::UnboundedReceiver<Vec<f32>>,
+    report_tx: Option<mpsc::UnboundedSender<ClientMessage>>,
+    connection: quinn::Connection,
+) {
+    let encode_state_clone = encode_state.clone();
+
+    loop {
+        tokio::select! {
+            Some(pcm) = mic_rx.recv() => {
+                let mut state = encode_state.lock();
+                state.mic_buffer.extend_from_slice(&pcm);
+            }
+            Some(pcm) = far_end_rx.recv() => {
+                let mut state = encode_state.lock();
+                state.far_end_buffer.extend_from_slice(&pcm);
+                let max_samples = 48000;
+                let cur_len = state.far_end_buffer.len();
+                if cur_len > max_samples {
+                    state.far_end_buffer.drain(..cur_len - max_samples);
+                }
+            }
+            else => break,
+        }
+
+        let mut state = encode_state.lock();
+        let spf = state.samples_per_frame;
+
+        while state.mic_buffer.len() >= spf {
+            let mut frame: Vec<f32> = state.mic_buffer.drain(..spf).collect();
+
+            state.process_aec(&mut frame);
+            state.process_denoise(&mut frame, &encode_state_clone);
+            if state.handle_vad(&frame, &report_tx) {
+                continue;
+            }
+
+            let seq = state.next_send_sequence;
+            state.next_send_sequence += 1;
+
+            if state.simulated_loss > 0.0 && rand::random::<f32>() < state.simulated_loss {
+                continue;
+            }
+
+            let mut buf = vec![0u8; 1500];
+            if let Ok(len) = state.encoder.encode_float(&frame, &mut buf) {
+                buf.truncate(len);
+                let pkt_bytes = proxa_protocol::ClientAudioPacket::serialize(seq, &buf);
+                let _ = connection.send_datagram(pkt_bytes.into());
+            }
+        }
+    }
+}

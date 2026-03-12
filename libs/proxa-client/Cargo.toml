@@ -2,3 +2,22 @@
 name = "proxa-client"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+proxa-protocol = { path = "../proxa-protocol" }
+quinn.workspace = true
+opus.workspace = true
+tokio.workspace = true
+anyhow = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+parking_lot = "0.12"
+bincode = "1.3"
+bytes = "1.11.1"
+log.workspace = true
+rand = { version = "0.10.0", features = ["default", "std"] }
+nnnoiseless.workspace = true
+aec3.workspace = true
+deep_filter.workspace = true
+tract-onnx.workspace = true
+ndarray.workspace = true
+rustls-native-certs = "0.8.3"
