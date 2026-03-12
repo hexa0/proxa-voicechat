@@ -24,6 +24,7 @@ static LOG_SINK: LazyLock<Mutex<VecDeque<(log::Level, String)>>> =
 static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 // we have to do some custom log rendering to prevent funky some rendering issues
+// TODO: respect the RUST_LOG environment variable like env_logger does
 struct TuiLogger;
 impl log::Log for TuiLogger {
     fn enabled(&self, _metadata: &log::Metadata) -> bool {
