@@ -268,7 +268,7 @@ async fn main() -> Result<()> {
                             let controls_text = vec![
                                 Line::from(vec![Span::styled("controls", Style::default().add_modifier(Modifier::BOLD))]),
                                 Line::from(vec![Span::raw("x"), Span::raw(" to leave room")]),
-                                Line::from(vec![Span::raw("n"), Span::raw(" to cycle denoise")]),
+                                Line::from(vec![Span::raw("n"), Span::raw(" to cycle denoisers")]),
                                 Line::from(vec![Span::raw("e"), Span::raw(" to toggle echo cancellation")]),
                                 Line::from(vec![Span::raw("up/down"), Span::raw(" arrows to adjust simulated outbound packet loss (hold shift for fine control)")]),
                                 Line::from(""),
