@@ -288,7 +288,7 @@ async fn main() -> Result<()> {
                                 Line::from(vec![
                                     Span::raw("noise reduction: "),
                                     Span::styled(format!("{:?}", denoise_method), Style::default().fg(if denoise_method != proxa_client::DenoiseMethod::Off { Color::Green } else { Color::Red })),
-                                    Span::raw(" | echo cancel: "),
+                                    Span::raw(" | echo canceling: "),
                                     Span::styled(if aec_enabled { "ON" } else { "OFF" }, Style::default().fg(if aec_enabled { Color::Green } else { Color::Red })),
                                 ]),
                                 Line::from(vec![
