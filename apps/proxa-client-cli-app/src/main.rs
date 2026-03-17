@@ -182,15 +182,18 @@ async fn main() -> Result<()> {
         log::error!("{}", e);
     }
 
-    // debug print all audio devices
-    log::info!("detected input devices:");
-    for dev in ProxaClient::enumerate_input_devices() {
-        // log::info!("  - {} (ID: {})", dev.name, dev.id);
-    }
-    log::info!("detected output devices:");
-    for dev in ProxaClient::enumerate_output_devices() {
-        // log::info!("  - {} (ID: {})", dev.name, dev.id);
-    }
+    // test device enumeration, this didn't work since cpal has a bug with pipewire
+    // on my system `pactl list sources short` and `pactl list sinks short` returns the correct results unlike cpal
+    // although we don't need this i kept this code for testing in the future when cpal fixes this
+
+    // log::info!("detected input devices:");
+    // for dev in ProxaClient::enumerate_input_devices() {
+    //     log::info!("  - {} (ID: {})", dev.name, dev.id);
+    // }
+    // log::info!("detected output devices:");
+    // for dev in ProxaClient::enumerate_output_devices() {
+    //     log::info!("  - {} (ID: {})", dev.name, dev.id);
+    // }
 
     // outer loop: room selection
     loop {
