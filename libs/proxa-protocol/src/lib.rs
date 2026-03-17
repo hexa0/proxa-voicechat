@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
     /// request to join a room.
-    JoinRoom(String),
+    JoinRoom { room_name: String, channels: u8 },
     /// graceful disconnect from the current room.
     LeaveRoom,
     ReportPeerLoss {
@@ -13,14 +13,17 @@ pub enum ClientMessage {
     },
     /// signal that we are entering/leaving a silent state to avoid misreporting loss.
     SetSilence(bool),
+    /// signal a change in our channel count.
+    SetChannels(u8),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMessage {
-    RoomJoined { peer_id: u32 },
-    PeerJoined { peer_id: u32 },
+    RoomJoined { peer_id: u32, channels: u8 },
+    PeerJoined { peer_id: u32, channels: u8 },
     PeerLeft { peer_id: u32 },
     PeerSilence { peer_id: u32, silenced: bool },
+    PeerChannels { peer_id: u32, channels: u8 },
     TargetLossRate(f32),
     Error(String),
 }

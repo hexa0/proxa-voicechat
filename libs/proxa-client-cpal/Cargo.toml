@@ -1,5 +1,6 @@
 [package]
 name = "proxa-client-cpal"
+description = "cpal audio backend implementation for proxa"
 version.workspace = true
 edition.workspace = true
 

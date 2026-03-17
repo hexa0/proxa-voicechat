@@ -2294,6 +2294,8 @@ dependencies = [
  "rand 0.10.0",
  "rustls",
  "rustls-native-certs",
+ "serde",
+ "thiserror 2.0.18",
  "tokio",
  "tract-onnx 0.21.14",
 ]
@@ -2357,21 +2359,27 @@ name = "proxa-relay-app"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "bincode",
  "clap 4.5.60",
- "dashmap",
  "env_logger",
- "log",
- "proxa-protocol",
- "quinn",
- "rcgen",
- "rustls",
+ "proxa-relay-server",
  "tokio",
 ]
 
 [[package]]
 name = "proxa-relay-server"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "dashmap",
+ "log",
+ "proxa-protocol",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "tokio",
+]
 
 [[package]]
 name = "quinn"
@@ -2749,6 +2757,15 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

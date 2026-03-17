@@ -1,5 +1,6 @@
 [package]
 name = "proxa-protocol"
+description = "define the protocol used to send and recieve data between the proxa server, proxa client and game"
 version.workspace = true
 edition.workspace = true
 

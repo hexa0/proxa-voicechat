@@ -14,15 +14,17 @@ pub struct EncodeState {
     pub encoder: opus::Encoder,
     pub channels: opus::Channels,
     pub samples_per_frame: usize,
-    pub simulated_loss: f32,
+    pub simulated_outbound_loss: f32,
     pub denoise_method: DenoiseMethod,
-    pub aec_enabled: bool,
+    pub echo_cancellation_enabled: bool,
     pub rnnoise_state_left: Option<nnnoiseless::DenoiseState<'static>>,
     pub rnnoise_state_right: Option<nnnoiseless::DenoiseState<'static>>,
     pub aec: Option<AecWrapper>,
     pub dfn3_engine: Option<DfEngine>,
     pub dfn3_model_path: Option<std::path::PathBuf>,
     pub dfn3_loading: bool,
+    pub frame_duration_ms: f32,
+    pub use_low_delay: bool,
     pub next_send_sequence: u32,
     pub volume: f32,
     pub target_bitrate: i32,
@@ -43,56 +45,66 @@ impl EncodeState {
     }
 
     pub fn process_aec(&mut self, frame: &mut [f32]) {
-        if !self.aec_enabled {
+        if !self.echo_cancellation_enabled {
             return;
         }
 
-        let channels = if self.channels == opus::Channels::Stereo {
+        let mic_channels = if self.channels == opus::Channels::Stereo {
             2
         } else {
             1
         };
-        let render_samples_per_aec_block = 480 * channels;
-        let capture_samples_per_aec_block = 480 * channels;
+        let speaker_channels = 2; // speaker output in Proxa is hardcoded to Stereo
 
-        let drain_len = self
+        let capture_block_size = 480 * mic_channels;
+        let render_block_size = 480 * speaker_channels;
+
+        let num_blocks = frame.len() / capture_block_size;
+        if num_blocks == 0 {
+            return; // too small for AEC3 (needs 10ms)
+        }
+
+        let required_render = num_blocks * render_block_size;
+        let mut render_data = self
             .far_end_buffer
-            .len()
-            .min(render_samples_per_aec_block * 2);
-        let render_data: Vec<f32> = self.far_end_buffer.drain(..drain_len).collect();
+            .drain(..self.far_end_buffer.len().min(required_render))
+            .collect::<Vec<f32>>();
+
+        // pad with zeros if we don't have enough render data
+        if render_data.len() < required_render {
+            render_data.resize(required_render, 0.0);
+        }
 
         if let Some(ref mut aec) = self.aec {
             for (c_block, r_block) in frame
-                .chunks_mut(capture_samples_per_aec_block)
-                .zip(render_data.chunks(render_samples_per_aec_block))
+                .chunks_mut(capture_block_size)
+                .zip(render_data.chunks(render_block_size))
             {
-                if c_block.len() == capture_samples_per_aec_block
-                    && r_block.len() == render_samples_per_aec_block
-                {
-                    let mut capture_mono = [0.0f32; 480];
-                    let mut render_mono = [0.0f32; 480];
+                let mut capture_mono = [0.0f32; 480];
+                let mut render_mono = [0.0f32; 480];
 
-                    if channels == 2 {
-                        for i in 0..480 {
-                            capture_mono[i] = (c_block[i * 2] + c_block[i * 2 + 1]) / 2.0;
-                            render_mono[i] = (r_block[i * 2] + r_block[i * 2 + 1]) / 2.0;
-                        }
-                    } else {
-                        capture_mono.copy_from_slice(c_block);
-                        render_mono.copy_from_slice(r_block);
+                if mic_channels == 2 {
+                    for i in 0..480 {
+                        capture_mono[i] = (c_block[i * 2] + c_block[i * 2 + 1]) / 2.0;
                     }
+                } else {
+                    capture_mono.copy_from_slice(c_block);
+                }
 
-                    let mut out = [0.0f32; 480];
-                    let _ = aec.process(&capture_mono, Some(&render_mono), false, &mut out);
+                for i in 0..480 {
+                    render_mono[i] = (r_block[i * 2] + r_block[i * 2 + 1]) / 2.0;
+                }
 
-                    if channels == 2 {
-                        for i in 0..480 {
-                            c_block[i * 2] = out[i];
-                            c_block[i * 2 + 1] = out[i];
-                        }
-                    } else {
-                        c_block.copy_from_slice(&out);
+                let mut out = [0.0f32; 480];
+                let _ = aec.process(&capture_mono, Some(&render_mono), false, &mut out);
+
+                if mic_channels == 2 {
+                    for i in 0..480 {
+                        c_block[i * 2] = out[i];
+                        c_block[i * 2 + 1] = out[i];
                     }
+                } else {
+                    c_block.copy_from_slice(&out);
                 }
             }
         }
@@ -116,41 +128,37 @@ impl EncodeState {
         } else {
             1
         };
-        if channels == 2 {
-            if let Some(mut d) = self.rnnoise_state_left.take() {
-                for chunk in frame.chunks_mut(480 * 2) {
-                    if chunk.len() == 480 * 2 {
-                        let mut mono = [0.0f32; 480];
+
+        if let Some(mut d) = self.rnnoise_state_left.take() {
+            for chunk in frame.chunks_mut(480 * channels) {
+                if chunk.len() == 480 * channels {
+                    let mut mono = [0.0f32; 480];
+                    if channels == 2 {
                         for i in 0..480 {
                             mono[i] = (chunk[i * 2] + chunk[i * 2 + 1]) * 16384.0;
                         }
-                        let mut out = [0.0f32; 480];
-                        d.process_frame(&mut out, &mono);
+                    } else {
+                        for i in 0..480 {
+                            mono[i] = chunk[i] * 32768.0;
+                        }
+                    }
+
+                    let mut out = [0.0f32; 480];
+                    d.process_frame(&mut out, &mono);
+
+                    if channels == 2 {
                         for i in 0..480 {
                             chunk[i * 2] = out[i] / 32768.0;
                             chunk[i * 2 + 1] = out[i] / 32768.0;
                         }
-                    }
-                }
-                self.rnnoise_state_left = Some(d);
-            }
-        } else {
-            if let Some(mut d) = self.rnnoise_state_left.take() {
-                for chunk in frame.chunks_mut(480) {
-                    if chunk.len() == 480 {
-                        for sample in chunk.iter_mut() {
-                            *sample *= 32768.0;
-                        }
-                        let mut out = [0.0f32; 480];
-                        let chunk_arr: &[f32; 480] = (&*chunk).try_into().unwrap();
-                        d.process_frame(&mut out, chunk_arr);
-                        for (i, sample) in chunk.iter_mut().enumerate() {
-                            *sample = out[i] / 32768.0;
+                    } else {
+                        for i in 0..480 {
+                            chunk[i] = out[i] / 32768.0;
                         }
                     }
                 }
-                self.rnnoise_state_left = Some(d);
             }
+            self.rnnoise_state_left = Some(d);
         }
     }
 
@@ -265,7 +273,7 @@ pub async fn run_encode_task(
     mut mic_rx: mpsc::UnboundedReceiver<Vec<f32>>,
     mut far_end_rx: mpsc::UnboundedReceiver<Vec<f32>>,
     report_tx: Option<mpsc::UnboundedSender<ClientMessage>>,
-    connection: quinn::Connection,
+    connection_slot: Arc<parking_lot::RwLock<Option<quinn::Connection>>>,
 ) {
     let encode_state_clone = encode_state.clone();
 
@@ -302,7 +310,9 @@ pub async fn run_encode_task(
             let seq = state.next_send_sequence;
             state.next_send_sequence += 1;
 
-            if state.simulated_loss > 0.0 && rand::random::<f32>() < state.simulated_loss {
+            if state.simulated_outbound_loss > 0.0
+                && rand::random::<f32>() < state.simulated_outbound_loss
+            {
                 continue;
             }
 
@@ -310,7 +320,9 @@ pub async fn run_encode_task(
             if let Ok(len) = state.encoder.encode_float(&frame, &mut buf) {
                 buf.truncate(len);
                 let pkt_bytes = proxa_protocol::ClientAudioPacket::serialize(seq, &buf);
-                let _ = connection.send_datagram(pkt_bytes.into());
+                if let Some(conn) = connection_slot.read().as_ref() {
+                    let _ = conn.send_datagram(pkt_bytes.into());
+                }
             }
         }
     }

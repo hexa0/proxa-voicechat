@@ -1,17 +1,38 @@
-use anyhow::{Context, Result};
+use crate::error::ProxaError;
+use crate::error::Result as ProxaResult;
 use parking_lot::Mutex;
 use proxa_protocol::{ClientMessage, ServerAudioPacket, ServerMessage};
-use quinn::{Connection, Endpoint};
+use quinn::Endpoint;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Weak;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+pub static ACTIVE_CLIENT: parking_lot::Mutex<Option<Weak<ProxaClient>>> =
+    parking_lot::const_mutex(None);
 
 use crate::aec3::AecWrapper;
 use crate::encode::{EncodeState, run_encode_task};
 use crate::peer::PeerState;
-use crate::types::{DenoiseMethod, FRAME_DURATION_MS, OPUS_SAMPLE_RATE, SILENCE_BITRATE};
+use crate::types::{AudioDevice, DenoiseMethod, OPUS_SAMPLE_RATE, SILENCE_BITRATE};
+
+pub trait AudioBackend: Send + Sync {
+    fn enumerate_input_devices(&self) -> Vec<AudioDevice>;
+    fn enumerate_output_devices(&self) -> Vec<AudioDevice>;
+    fn set_input_device(&self, id: &str) -> ProxaResult<()>;
+    fn set_output_device(&self, id: &str) -> ProxaResult<()>;
+    fn get_current_input_device(&self) -> Option<AudioDevice>;
+    fn get_current_output_device(&self) -> Option<AudioDevice>;
+}
+
+pub static AUDIO_BACKEND_PROVIDER: parking_lot::Mutex<Option<Box<dyn AudioBackend>>> =
+    parking_lot::const_mutex(None);
+
+pub fn register_audio_backend(backend: Box<dyn AudioBackend>) {
+    *AUDIO_BACKEND_PROVIDER.lock() = Some(backend);
+}
 
 pub struct ClientState {
     pub peers: HashMap<u32, PeerState>,
@@ -23,6 +44,10 @@ pub struct ClientState {
 
 impl ClientState {
     pub fn handle_audio_packet(&mut self, packet: ServerAudioPacket) {
+        if packet.payload.len() > 1200 { // matches MAX_AUDIO_PACKET_SIZE
+            log::warn!("received oversized audio packet from peer {}", packet.peer_id);
+            return;
+        }
         if let Some(peer) = self.peers.get_mut(&packet.peer_id) {
             if peer.awaiting_first_packet {
                 peer.next_decode_seq = packet.sequence;
@@ -32,7 +57,7 @@ impl ClientState {
             }
             if packet.sequence + 1000 >= peer.next_decode_seq {
                 if packet.sequence < peer.next_decode_seq {
-                    peer.target_jitter_frames = (peer.target_jitter_frames + 1).min(1000);
+                    peer.target_jitter_frames = (peer.target_jitter_frames + 1).min(50);
                 }
                 peer.jitter_buffer.insert(packet.sequence, packet.payload);
             }
@@ -50,8 +75,13 @@ impl ClientState {
         encode_state: &Arc<Mutex<EncodeState>>,
     ) {
         match msg {
-            ServerMessage::PeerJoined { peer_id } => {
-                if let Ok(peer) = PeerState::new(self.channels) {
+            ServerMessage::PeerJoined { peer_id, channels } => {
+                let opus_channels = if channels >= 2 {
+                    opus::Channels::Stereo
+                } else {
+                    opus::Channels::Mono
+                };
+                if let Ok(peer) = PeerState::new(opus_channels) {
                     self.peers.insert(peer_id, peer);
                 }
             }
@@ -83,13 +113,39 @@ impl ClientState {
                     peer.is_silenced = silenced;
                 }
             }
+            ServerMessage::PeerChannels { peer_id, channels } => {
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    let opus_channels = if channels >= 2 {
+                        opus::Channels::Stereo
+                    } else {
+                        opus::Channels::Mono
+                    };
+                    if let Ok(new_decoder) = opus::Decoder::new(OPUS_SAMPLE_RATE, opus_channels) {
+                        peer.decoder = new_decoder;
+                        peer.channels = opus_channels;
+                        peer.buffer.clear();
+                        peer.jitter_buffer.clear();
+                        peer.is_buffering = true;
+                        peer.awaiting_first_packet = true;
+                    }
+                }
+            }
             _ => {}
         }
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ClientConfig {
+    pub server_host: String,
+    pub room_name: String,
+    pub channels: opus::Channels,
+    pub frame_duration_ms: f32,
+    pub use_low_delay: bool,
+    pub allow_self_signed: bool,
+}
+
 pub struct ProxaClient {
-    pub connection: Connection,
     pub state: Arc<Mutex<ClientState>>,
     pub encode_state: Arc<Mutex<EncodeState>>,
     pub mic_tx: mpsc::UnboundedSender<Vec<f32>>,
@@ -100,134 +156,100 @@ pub struct ProxaClient {
 }
 
 impl ProxaClient {
-    pub async fn connect(
-        server_host: &str,
-        room_name: &str,
-        channels: opus::Channels,
-        allow_self_signed: bool,
-    ) -> Result<Self> {
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    pub fn new(config: ClientConfig) -> ProxaResult<Arc<Self>> {
+        log::info!(
+            "connecting to {} room '{}' (mic: {:?}, frame: {}ms, low_delay: {})",
+            config.server_host,
+            config.room_name,
+            config.channels,
+            config.frame_duration_ms,
+            config.use_low_delay
+        );
 
-        let host_port = if server_host.contains(':') {
-            server_host.to_string()
-        } else {
-            format!("{}:39201", server_host)
-        };
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&host_port).await?.collect();
-        let mut target_addr = addrs.iter().find(|a| a.is_ipv6()).copied();
-        if target_addr.is_none() {
-            target_addr = addrs.first().copied();
+        let server_host_owned = config.server_host.clone();
+        let room_name_owned = config.room_name.clone();
+        let mut endpoint = Endpoint::client(
+            "0.0.0.0:0"
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| ProxaError::Internal(e.to_string()))?,
+        )
+        .map_err(|e| ProxaError::Internal(e.to_string()))?;
+
+        let models_search_paths = [
+            std::path::PathBuf::from("models"),
+            std::path::PathBuf::from("model"),
+            std::path::PathBuf::from("dfn3"),
+        ];
+
+        let mut dfn3_model_path_opt = None;
+        let mut dfn3_engine_opt = None;
+
+        let global_engine = crate::dfn3::GLOBAL_DFN3_ENGINE.lock();
+        if let Some((p, e)) = &*global_engine {
+            dfn3_model_path_opt = Some(p.clone());
+            dfn3_engine_opt = Some(e.clone());
         }
-        let target_addr = target_addr.context("Failed to resolve server hostname")?;
+        drop(global_engine);
 
-        #[derive(Debug)]
-        struct SkipServerVerification;
-        impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-            fn verify_server_cert(
-                &self,
-                _end_entity: &rustls::pki_types::CertificateDer<'_>,
-                _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-                _server_name: &rustls::pki_types::ServerName<'_>,
-                _ocsp_response: &[u8],
-                _now: rustls::pki_types::UnixTime,
-            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
-            fn verify_tls12_signature(
-                &self,
-                _m: &[u8],
-                _c: &rustls::pki_types::CertificateDer<'_>,
-                _d: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            fn verify_tls13_signature(
-                &self,
-                _m: &[u8],
-                _c: &rustls::pki_types::CertificateDer<'_>,
-                _d: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                rustls::crypto::ring::default_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
+        if dfn3_engine_opt.is_none() {
+            for path in &models_search_paths {
+                if path.exists() {
+                    dfn3_model_path_opt = Some(path.clone());
+                    log::info!(
+                        "DeepFilterNet3 models discovered for lazy loading at {:?}",
+                        path
+                    );
+                    break;
+                }
             }
         }
 
-        let mut rustls_config = if allow_self_signed {
-            let mut config = rustls::ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth();
-            config
-                .dangerous()
-                .set_certificate_verifier(std::sync::Arc::new(SkipServerVerification));
-            config
+        let quic_config = if config.allow_self_signed {
+            crate::quic::make_client_config_self_signed()
         } else {
-            let native_certs = rustls_native_certs::load_native_certs();
-            let mut root_store = rustls::RootCertStore::empty();
-            for cert in native_certs.certs {
-                let _ = root_store.add(cert);
-            }
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
+            crate::quic::make_client_config()
         };
 
-        rustls_config.alpn_protocols = vec![b"proxa-hq".to_vec()];
         let mut transport_config = quinn::TransportConfig::default();
         transport_config
-            .max_idle_timeout(Some(std::time::Duration::from_secs(5).try_into().unwrap()));
-        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
+            .max_idle_timeout(Some(std::time::Duration::from_secs(1).try_into().unwrap()));
+        transport_config.keep_alive_interval(Some(std::time::Duration::from_millis(250)));
 
-        let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)?;
+        let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(quic_config)
+            .map_err(|e| ProxaError::Internal(e.to_string()))?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
         client_config.transport_config(Arc::new(transport_config));
         endpoint.set_default_client_config(client_config);
 
-        let connection = endpoint.connect(target_addr, "localhost")?.await?;
-        let (mut ctrl_send, mut ctrl_recv) = connection.open_bi().await?;
+        let app_mode = if config.use_low_delay {
+            opus::Application::LowDelay
+        } else {
+            opus::Application::Audio
+        };
 
-        let join_msg = bincode::serialize(&ClientMessage::JoinRoom(room_name.to_string()))?;
-        ctrl_send
-            .write_all(&(join_msg.len() as u32).to_le_bytes())
-            .await?;
-        ctrl_send.write_all(&join_msg).await?;
+        let mut encoder = opus::Encoder::new(OPUS_SAMPLE_RATE, config.channels, app_mode)
+            .map_err(|e| ProxaError::Internal(e.to_string()))?;
+        encoder
+            .set_bitrate(opus::Bitrate::Bits(32000))
+            .map_err(|e| ProxaError::Internal(e.to_string()))?;
+        encoder
+            .set_signal(opus::Signal::Voice)
+            .map_err(|e| ProxaError::Internal(e.to_string()))?;
+        encoder
+            .set_inband_fec(true)
+            .map_err(|e| ProxaError::Internal(e.to_string()))?;
+        encoder
+            .set_packet_loss_perc(0)
+            .map_err(|e| ProxaError::Internal(e.to_string()))?;
 
-        let mut len_buf = [0u8; 4];
-        ctrl_recv.read_exact(&mut len_buf).await?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        let mut msg_buf = vec![0u8; len];
-        ctrl_recv.read_exact(&mut msg_buf).await?;
-
-        let srv_msg: ServerMessage = bincode::deserialize(&msg_buf)?;
-        match srv_msg {
-            ServerMessage::RoomJoined { peer_id } => {
-                log::info!("joined room with peer ID: {}", peer_id);
-            }
-            ServerMessage::Error(e) => {
-                anyhow::bail!("server refused connection: {}", e);
-            }
-            _ => {
-                anyhow::bail!("unexpected initial message from server");
-            }
-        }
-
-        let mut encoder = opus::Encoder::new(OPUS_SAMPLE_RATE, channels, opus::Application::Voip)?;
-        encoder.set_bitrate(opus::Bitrate::Bits(32000))?;
-        encoder.set_inband_fec(true)?;
-        encoder.set_packet_loss_perc(0)?;
-
-        let num_channels = if channels == opus::Channels::Stereo {
+        let num_channels = if config.channels == opus::Channels::Stereo {
             2
         } else {
             1
         };
         let samples_per_frame =
-            (OPUS_SAMPLE_RATE as usize * FRAME_DURATION_MS * num_channels) / 1000;
+            (OPUS_SAMPLE_RATE as f32 * config.frame_duration_ms * num_channels as f32 / 1000.0)
+                as usize;
 
         let (mic_tx, mic_rx) = mpsc::unbounded_channel::<Vec<f32>>();
         let (far_end_tx, far_end_rx) = mpsc::unbounded_channel::<Vec<f32>>();
@@ -235,53 +257,51 @@ impl ProxaClient {
 
         let state = Arc::new(Mutex::new(ClientState {
             peers: HashMap::new(),
-            channels,
+            channels: config.channels,
             samples_per_frame,
             global_loss_rate: 0.0,
             report_tx: Some(report_tx),
         }));
 
-        encoder.set_bitrate(opus::Bitrate::Bits(SILENCE_BITRATE.min(32000)))?;
-        encoder.set_inband_fec(false)?;
-        encoder.set_packet_loss_perc(0)?;
-
-        let global_engine = crate::dfn3::GLOBAL_DFN3_ENGINE.lock();
-        let (engine, path) = match &*global_engine {
-            Some((p, e)) => (Some(e.clone()), Some(p.clone())),
-            None => (None, None),
-        };
-        drop(global_engine);
+        encoder
+            .set_bitrate(opus::Bitrate::Bits(SILENCE_BITRATE.min(32000)))
+            .map_err(|e| ProxaError::Internal(e.to_string()))?;
+        encoder
+            .set_inband_fec(false)
+            .map_err(|e| ProxaError::Internal(e.to_string()))?;
+        encoder
+            .set_packet_loss_perc(0)
+            .map_err(|e| ProxaError::Internal(e.to_string()))?;
 
         let encode_state = Arc::new(Mutex::new(EncodeState {
             mic_buffer: Vec::new(),
             far_end_buffer: Vec::new(),
             encoder,
-            channels,
+            channels: config.channels,
             samples_per_frame,
-            simulated_loss: 0.0,
+            simulated_outbound_loss: 0.0,
             denoise_method: DenoiseMethod::Off,
-            aec_enabled: false,
+            echo_cancellation_enabled: false,
             rnnoise_state_left: Some(*nnnoiseless::DenoiseState::new()),
             rnnoise_state_right: Some(*nnnoiseless::DenoiseState::new()),
-            aec: Some(AecWrapper(
-                aec3::voip::VoipAec3::builder(OPUS_SAMPLE_RATE as usize, 1, 1)
-                    .build()
-                    .expect("Failed to build AEC3"),
-            )),
-            dfn3_engine: engine,
-            dfn3_model_path: path,
+            aec: Some(AecWrapper::new(OPUS_SAMPLE_RATE)),
+            dfn3_engine: dfn3_engine_opt,
+            dfn3_model_path: dfn3_model_path_opt,
             dfn3_loading: false,
+            frame_duration_ms: config.frame_duration_ms,
+            use_low_delay: config.use_low_delay,
             next_send_sequence: 0,
             volume: 0.0,
             target_bitrate: 32000,
-            last_voice_time: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            last_voice_time: std::time::Instant::now(),
             is_throttled: true,
             actual_loss_perc: 0,
         }));
 
         let state_clone = state.clone();
         let encode_state_clone = encode_state.clone();
-        let conn_clone = connection.clone();
+        let connection_slot = Arc::new(parking_lot::RwLock::new(None));
+
         let (disconnect_tx, mut disconnect_rx) = mpsc::channel(1);
         let report_tx_encode = state.lock().report_tx.clone();
 
@@ -294,53 +314,188 @@ impl ProxaClient {
             mic_rx,
             far_end_rx,
             report_tx_encode,
-            connection.clone(),
+            connection_slot.clone(),
         ));
 
         let _network_task = tokio::spawn(async move {
-            let mut ctrl_recv = ctrl_recv;
-            let mut ctrl_send = ctrl_send;
-            let mut len_buf = [0u8; 4];
-
             loop {
-                tokio::select! {
-                    _ = disconnect_rx.recv() => {
-                         let msg = bincode::serialize(&ClientMessage::LeaveRoom).unwrap();
-                         let _ = ctrl_send.write_all(&(msg.len() as u32).to_le_bytes()).await;
-                         let _ = ctrl_send.write_all(&msg).await;
-                         break;
-                    }
-                    Some(msg) = report_rx.recv() => {
-                         let msg_bytes = bincode::serialize(&msg).unwrap();
-                         let _ = ctrl_send.write_all(&(msg_bytes.len() as u32).to_le_bytes()).await;
-                         let _ = ctrl_send.write_all(&msg_bytes).await;
-                    }
-                    datagram = conn_clone.read_datagram() => {
-                        match datagram {
-                            Ok(data) => {
-                                if let Some(packet) = ServerAudioPacket::deserialize(&data) {
-                                    state_clone.lock().handle_audio_packet(packet);
-                                }
+                // re-resolve in case of DNS change during runtime or retry loop
+                let host_port = if server_host_owned.contains(':') {
+                    server_host_owned.clone()
+                } else {
+                    format!("{}:39201", server_host_owned)
+                };
+
+                let target_addr = match tokio::net::lookup_host(&host_port).await {
+                    Ok(addrs) => {
+                        let resolved: Vec<std::net::SocketAddr> = addrs.collect();
+                        let mut ip = resolved.iter().find(|a| a.is_ipv6()).copied();
+                        if ip.is_none() {
+                            ip = resolved.first().copied();
+                        }
+                        match ip {
+                            Some(addr) => addr,
+                            None => {
+                                log::error!("Failed to resolve server hostname");
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                continue;
                             }
-                            Err(_) => break,
                         }
                     }
-                    res = ctrl_recv.read_exact(&mut len_buf) => {
-                        if res.is_err() { break; }
-                        let len = u32::from_le_bytes(len_buf) as usize;
-                        let mut msg_buf = vec![0u8; len];
-                        if ctrl_recv.read_exact(&mut msg_buf).await.is_err() { break; }
-                        if let Ok(msg) = bincode::deserialize::<ServerMessage>(&msg_buf) {
-                            state_clone.lock().handle_server_message(msg, &encode_state_clone);
+                    Err(e) => {
+                        log::error!("Failed to resolve server hostname: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                };
+
+                let connection = match endpoint.connect(target_addr, "localhost") {
+                    Ok(connecting) => match connecting.await {
+                        Ok(conn) => conn,
+                        Err(err) => {
+                            log::error!("Connection to remote peer failed: {}", err);
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    },
+                    Err(err) => {
+                        log::error!("Failed connecting to remote peer endpoint: {}", err);
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                };
+
+                // clear previous state entirely
+                {
+                    let mut s = state_clone.lock();
+                    s.peers.clear();
+                    s.global_loss_rate = 0.0;
+                }
+
+                *connection_slot.write() = Some(connection.clone());
+
+                let (mut ctrl_send, mut ctrl_recv) = match connection.open_bi().await {
+                    Ok((s, r)) => (s, r),
+                    Err(e) => {
+                        log::error!("Failed opening controller port logic stream: {}", e);
+                        *connection_slot.write() = None;
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                };
+
+                let join_msg = bincode::serialize(&ClientMessage::JoinRoom {
+                    room_name: room_name_owned.clone(),
+                    channels: if config.channels == opus::Channels::Stereo {
+                        2
+                    } else {
+                        1
+                    },
+                })
+                .unwrap();
+                let _ = ctrl_send
+                    .write_all(&(join_msg.len() as u32).to_le_bytes())
+                    .await;
+                let _ = ctrl_send.write_all(&join_msg).await;
+
+                let mut len_buf = [0u8; 4];
+                if let Err(e) = ctrl_recv.read_exact(&mut len_buf).await {
+                    log::error!("Control stream error (len init read): {}", e);
+                    *connection_slot.write() = None;
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+
+                let len = u32::from_le_bytes(len_buf) as usize;
+                let mut msg_buf = vec![0u8; len];
+                if let Err(e) = ctrl_recv.read_exact(&mut msg_buf).await {
+                    log::error!("Control stream error (msg init read): {}", e);
+                    *connection_slot.write() = None;
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+
+                match bincode::deserialize::<ServerMessage>(&msg_buf) {
+                    Ok(ServerMessage::RoomJoined {
+                        peer_id,
+                        channels: _,
+                    }) => {
+                        log::info!(
+                            "joined room '{}' with peer ID: {}",
+                            room_name_owned,
+                            peer_id
+                        );
+                    }
+                    Ok(ServerMessage::Error(e)) => {
+                        log::error!("server refused connection: {}", e);
+                        *connection_slot.write() = None;
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    _ => {
+                        log::error!("unexpected initial message from server");
+                        *connection_slot.write() = None;
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                }
+
+                let conn_clone = connection.clone();
+                let mut disconnect_triggered = false;
+
+                loop {
+                    tokio::select! {
+                        _ = disconnect_rx.recv() => {
+                             let msg = bincode::serialize(&ClientMessage::LeaveRoom).unwrap();
+                             let _ = ctrl_send.write_all(&(msg.len() as u32).to_le_bytes()).await;
+                             let _ = ctrl_send.write_all(&msg).await;
+                             disconnect_triggered = true;
+                             break;
+                        }
+                        Some(msg) = report_rx.recv() => {
+                             let msg_bytes = bincode::serialize(&msg).unwrap();
+                             let _ = ctrl_send.write_all(&(msg_bytes.len() as u32).to_le_bytes()).await;
+                             let _ = ctrl_send.write_all(&msg_bytes).await;
+                        }
+                        datagram = conn_clone.read_datagram() => {
+                            match datagram {
+                                Ok(data) => {
+                                    if let Some(packet) = ServerAudioPacket::deserialize(&data) {
+                                        state_clone.lock().handle_audio_packet(packet);
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        res = ctrl_recv.read_exact(&mut len_buf) => {
+                            if res.is_err() { break; }
+                            let len = u32::from_le_bytes(len_buf) as usize;
+                            if len > 65536 { // matches MAX_CONTROL_MESSAGE_SIZE
+                                log::warn!("server sent oversized control message: {} bytes", len);
+                                break;
+                            }
+                            let mut msg_buf = vec![0u8; len];
+                            if ctrl_recv.read_exact(&mut msg_buf).await.is_err() { break; }
+                            if let Ok(msg) = bincode::deserialize::<ServerMessage>(&msg_buf) {
+                                state_clone.lock().handle_server_message(msg, &encode_state_clone);
+                            }
                         }
                     }
+                }
+
+                *connection_slot.write() = None;
+                if disconnect_triggered {
+                    log::info!("disconnect loop explicit exit executed.");
+                    break;
+                } else {
+                    log::warn!("connection interrupted. attempting to reconnect...");
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }
         });
 
-        log::info!("ProxaClient::connect finished");
-        Ok(Self {
-            connection,
+        log::info!("ProxaClient::new initialized and started tasks");
+        let client = Arc::new(Self {
             state,
             encode_state,
             mic_tx,
@@ -348,23 +503,105 @@ impl ProxaClient {
             _encode_task,
             _network_task,
             _disconnect_tx: disconnect_tx,
-        })
+        });
+
+        *ACTIVE_CLIENT.lock() = Some(Arc::downgrade(&client));
+
+        log::info!("client object created");
+        Ok(client)
     }
 
-    pub fn set_simulated_loss(&self, loss_pct: f32) {
+    pub fn set_simulated_outbound_loss(&self, loss_pct: f32) {
         let mut state = self.encode_state.lock();
-        state.simulated_loss = loss_pct.clamp(0.0, 1.0);
+        state.simulated_outbound_loss = loss_pct.clamp(0.0, 1.0);
     }
 
-    pub fn set_bitrate(&self, bitrate: i32) -> Result<()> {
+    pub fn set_bitrate(&self, bitrate: i32) -> ProxaResult<()> {
         let mut state = self.encode_state.lock();
         state.target_bitrate = bitrate;
         if !state.is_throttled {
             state
                 .encoder
                 .set_bitrate(opus::Bitrate::Bits(bitrate))
-                .context("Failed to set bitrate")?;
+                .map_err(|e| ProxaError::BitrateChange(e.to_string()))?;
         }
+
+        log::info!("set bitrate to {} bps", bitrate);
+
+        Ok(())
+    }
+
+    pub fn set_channels(&self, channels: opus::Channels) -> ProxaResult<()> {
+        let (frame_duration, low_delay) = {
+            let s = self.encode_state.lock();
+            (s.frame_duration_ms, s.use_low_delay)
+        };
+
+        let num_channels = if channels == opus::Channels::Stereo {
+            2
+        } else {
+            1
+        };
+        let samples_per_frame =
+            (OPUS_SAMPLE_RATE as f32 * frame_duration * num_channels as f32 / 1000.0) as usize;
+
+        // update encode state
+        {
+            let mut encode = self.encode_state.lock();
+            if encode.channels == channels {
+                return Ok(());
+            }
+
+            let app_mode = if low_delay {
+                opus::Application::LowDelay
+            } else {
+                opus::Application::Audio
+            };
+
+            let mut new_encoder =
+				// we opt to use opus::Application::Audio instead of opus::Application::Voip to prevent a high pass destroying the low-end, it sounds really bad on good microphones which capture the low-end correctly
+                opus::Encoder::new(OPUS_SAMPLE_RATE, channels, app_mode)
+                    .map_err(|e| ProxaError::ChannelSwitch(e.to_string()))?;
+            new_encoder
+                .set_bitrate(opus::Bitrate::Bits(encode.target_bitrate))
+                .map_err(|e| ProxaError::ChannelSwitch(e.to_string()))?;
+            new_encoder
+                // hint to the encoder that the signal is a voice, unlike setting Voip this won't destroy the low-end, this just makes the encoding more effecient
+                .set_signal(opus::Signal::Voice)
+                .map_err(|e| ProxaError::ChannelSwitch(e.to_string()))?;
+            new_encoder
+                .set_inband_fec(true)
+                .map_err(|e| ProxaError::ChannelSwitch(e.to_string()))?;
+            new_encoder
+                .set_packet_loss_perc(encode.actual_loss_perc)
+                .map_err(|e| ProxaError::ChannelSwitch(e.to_string()))?;
+
+            encode.encoder = new_encoder;
+            encode.channels = channels;
+            encode.samples_per_frame = samples_per_frame;
+            encode.mic_buffer.clear(); // clear buffer to prevent sample alignment issues
+        }
+
+        // update client state
+        {
+            let mut state = self.state.lock();
+            state.channels = channels;
+            state.samples_per_frame = samples_per_frame;
+
+            if let Some(tx) = &state.report_tx {
+                let _ = tx.send(ClientMessage::SetChannels(num_channels as u8));
+            }
+
+            for peer in state.peers.values_mut() {
+                peer.buffer.clear();
+                peer.jitter_buffer.clear();
+                peer.is_buffering = true;
+                peer.awaiting_first_packet = true;
+            }
+        }
+
+        log::info!("switched to {:?} mic audio mode", channels);
+
         Ok(())
     }
 
@@ -377,17 +614,20 @@ impl ProxaClient {
     pub fn set_denoise_method(&self, method: DenoiseMethod) {
         self.encode_state.lock().denoise_method = method;
     }
-    pub fn set_aec(&self, enabled: bool) {
-        self.encode_state.lock().aec_enabled = enabled;
+    pub fn set_echo_cancellation_enabled(&self, enabled: bool) {
+        self.encode_state.lock().echo_cancellation_enabled = enabled;
     }
-    pub fn load_dfn3_models<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.encode_state.lock().load_dfn3_models(path)
+    pub fn load_dfn3_models<P: AsRef<Path>>(&self, path: P) -> ProxaResult<()> {
+        self.encode_state
+            .lock()
+            .load_dfn3_models(path)
+            .map_err(|e| ProxaError::Internal(e.to_string()))
     }
     pub fn get_denoise_method(&self) -> DenoiseMethod {
         self.encode_state.lock().denoise_method
     }
-    pub fn get_aec_enabled(&self) -> bool {
-        self.encode_state.lock().aec_enabled
+    pub fn get_echo_cancellation_enabled(&self) -> bool {
+        self.encode_state.lock().echo_cancellation_enabled
     }
     pub fn get_channels(&self) -> opus::Channels {
         self.state.lock().channels
@@ -401,26 +641,21 @@ impl ProxaClient {
             *sample = 0.0;
         }
         let mut state = self.state.lock();
-        let client_channels = state.channels;
-        let spf = state.samples_per_frame;
+        let num_channels = 2; // output is always stereo
+        let spf = (OPUS_SAMPLE_RATE as usize * 20 * num_channels) / 1000;
         let report_tx = state.report_tx.clone();
 
         for (&peer_id, peer) in state.peers.iter_mut() {
             if peer.is_silenced && peer.jitter_buffer.is_empty() {
                 continue;
             }
-            let num_channels = if client_channels == opus::Channels::Stereo {
-                2
-            } else {
-                1
-            };
 
             // refill the buffer using PeerState logic
             peer.refill_buffer(
                 pcm.len(),
                 num_channels,
                 spf,
-                client_channels == opus::Channels::Stereo,
+                true, // output is always stereo
             );
 
             let available = peer.buffer.len();
@@ -458,9 +693,21 @@ impl ProxaClient {
             .collect()
     }
 
-    pub fn get_local_stats(&self) -> f32 {
+    pub fn get_local_volume(&self) -> f32 {
         self.encode_state.lock().volume
     }
+
+    pub fn get_voice_state(&self) -> crate::types::VoiceState {
+        let state = self.encode_state.lock();
+        if state.is_throttled {
+            crate::types::VoiceState::Silenced
+        } else if state.volume > crate::VOICE_THRESHOLD {
+            crate::types::VoiceState::Speaking
+        } else {
+            crate::types::VoiceState::Waiting
+        }
+    }
+
     pub fn get_max_loss_rate(&self) -> f32 {
         self.state.lock().global_loss_rate
     }
@@ -468,35 +715,50 @@ impl ProxaClient {
         let _ = self._disconnect_tx.try_send(());
     }
 
-    pub fn auto_load_models(&self) {
-        let models_search_paths = [
-            std::path::PathBuf::from("models"),
-            std::path::PathBuf::from("model"),
-            std::path::PathBuf::from("dfn3"),
-        ];
+    pub fn enumerate_input_devices() -> Vec<AudioDevice> {
+        AUDIO_BACKEND_PROVIDER
+            .lock()
+            .as_ref()
+            .map(|b| b.enumerate_input_devices())
+            .unwrap_or_default()
+    }
 
-        let mut lock = self.encode_state.lock();
-        if lock.dfn3_engine.is_some() {
-            return;
-        }
+    pub fn enumerate_output_devices() -> Vec<AudioDevice> {
+        AUDIO_BACKEND_PROVIDER
+            .lock()
+            .as_ref()
+            .map(|b| b.enumerate_output_devices())
+            .unwrap_or_default()
+    }
 
-        for path in &models_search_paths {
-            if path.exists() {
-                match lock.load_dfn3_models(path) {
-                    Ok(_) => {
-                        log::info!("DeepFilterNet3 models loaded successfully");
-                        break;
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "found DeepFilterNet3 models at {:?} but failed to load: {}",
-                            path,
-                            e
-                        );
-                    }
-                }
-            }
-        }
+    pub fn set_input_device(id: &str) -> ProxaResult<()> {
+        AUDIO_BACKEND_PROVIDER
+            .lock()
+            .as_ref()
+            .ok_or_else(|| ProxaError::AudioInit("no audio backend registered".to_string()))?
+            .set_input_device(id)
+    }
+
+    pub fn set_output_device(id: &str) -> ProxaResult<()> {
+        AUDIO_BACKEND_PROVIDER
+            .lock()
+            .as_ref()
+            .ok_or_else(|| ProxaError::AudioInit("no audio backend registered".to_string()))?
+            .set_output_device(id)
+    }
+
+    pub fn get_current_input_device() -> Option<AudioDevice> {
+        AUDIO_BACKEND_PROVIDER
+            .lock()
+            .as_ref()
+            .and_then(|b| b.get_current_input_device())
+    }
+
+    pub fn get_current_output_device() -> Option<AudioDevice> {
+        AUDIO_BACKEND_PROVIDER
+            .lock()
+            .as_ref()
+            .and_then(|b| b.get_current_output_device())
     }
 }
 

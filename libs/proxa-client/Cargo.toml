@@ -1,5 +1,6 @@
 [package]
 name = "proxa-client"
+description = "handle all audio processing (denoising, de-echo, encoding/decoding and various other stuff to gracefully handle packet loss and ping jitter)"
 version.workspace = true
 edition.workspace = true
 
@@ -21,3 +22,5 @@ deep_filter.workspace = true
 tract-onnx.workspace = true
 ndarray.workspace = true
 rustls-native-certs = "0.8.3"
+thiserror = "2.0.18"
+serde = { version = "1.0.228", features = ["derive"] }

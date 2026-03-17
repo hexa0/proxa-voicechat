@@ -1,16 +1,89 @@
-use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use proxa_client::ProxaClient;
-use std::sync::Arc;
+use proxa_client::{ProxaError, ProxaResult};
 
-pub struct AudioBackend {
-    _input_stream: cpal::Stream,
-    _output_stream: cpal::Stream,
+use proxa_client::client::AudioBackend;
+use proxa_client::types::AudioDevice;
+
+pub struct CpalBackendImpl {
+    host: std::sync::Arc<cpal::Host>,
 }
 
-pub fn start_audio_backend(
-    client_slot: Arc<parking_lot::Mutex<Option<Arc<ProxaClient>>>>,
-) -> Result<AudioBackend> {
+impl AudioBackend for CpalBackendImpl {
+    // currently device enumeration is bugged in cpal on pipewire, once that is fixed by cpal this needs to be retested
+
+    fn enumerate_input_devices(&self) -> Vec<AudioDevice> {
+        self.host
+            .input_devices()
+            .map(|devices| {
+                devices
+                    .map(|d| {
+                        #[allow(deprecated)]
+                        let name = d.name().unwrap_or_else(|_| "Unknown".to_string());
+                        let id = format!("{:?}", d.id());
+                        AudioDevice { name, id }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn enumerate_output_devices(&self) -> Vec<AudioDevice> {
+        self.host
+            .output_devices()
+            .map(|devices| {
+                devices
+                    .map(|d| {
+                        #[allow(deprecated)]
+                        let name = d.name().unwrap_or_else(|_| "Unknown".to_string());
+                        let id = format!("{:?}", d.id());
+                        AudioDevice { name, id }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn set_input_device(&self, _id: &str) -> proxa_client::ProxaResult<()> {
+        // TODO: implement device switching
+        Ok(())
+    }
+
+    fn set_output_device(&self, _id: &str) -> proxa_client::ProxaResult<()> {
+        // TODO: implement device switching
+        Ok(())
+    }
+
+    fn get_current_input_device(&self) -> Option<AudioDevice> {
+        self.host.default_input_device().map(|d| {
+            #[allow(deprecated)]
+            let name = d.name().unwrap_or_else(|_| "Unknown".to_string());
+            let id = format!("{:?}", d.id());
+            AudioDevice { name, id }
+        })
+    }
+
+    fn get_current_output_device(&self) -> Option<AudioDevice> {
+        self.host.default_output_device().map(|d| {
+            #[allow(deprecated)]
+            let name = d.name().unwrap_or_else(|_| "Unknown".to_string());
+            let id = format!("{:?}", d.id());
+            AudioDevice { name, id }
+        })
+    }
+}
+
+pub struct AudioBackendState {
+    _streams: (cpal::Stream, cpal::Stream),
+}
+
+static BACKEND: parking_lot::Mutex<Option<AudioBackendState>> = parking_lot::const_mutex(None);
+
+pub fn init() -> ProxaResult<()> {
+    let mut guard = BACKEND.lock();
+    if guard.is_some() {
+        return Ok(());
+    }
+
     let host = {
         #[cfg(target_os = "linux")]
         {
@@ -30,34 +103,57 @@ pub fn start_audio_backend(
         }
     };
 
+    let host = std::sync::Arc::new(host);
+
+    let backend_impl = CpalBackendImpl { host: host.clone() };
+    proxa_client::client::register_audio_backend(Box::new(backend_impl));
+
     let input_device = host
         .default_input_device()
-        .context("No input device available")?;
+        .ok_or_else(|| ProxaError::AudioInit("no default input device".to_string()))?;
     let output_device = host
         .default_output_device()
-        .context("No output device available")?;
+        .ok_or_else(|| ProxaError::AudioInit("no default output device".to_string()))?;
 
-    let input_config = input_device.default_input_config()?;
-    let output_config = output_device.default_output_config()?;
+    // name is deprecated so we'll need to switch off of it eventually
 
-    let hw_in_channels = input_config.channels() as usize;
-    let hw_out_channels = output_config.channels() as usize;
+    #[allow(deprecated)]
+    let in_name = input_device
+        .name()
+        .unwrap_or_else(|_| "Unknown".to_string());
+    #[allow(deprecated)]
+    let out_name = output_device
+        .name()
+        .unwrap_or_else(|_| "Unknown".to_string());
 
-    let build_config = |config: &cpal::SupportedStreamConfig| -> cpal::StreamConfig {
-        let mut c: cpal::StreamConfig = config.clone().into();
-        c.sample_rate = 48000;
-        c.buffer_size = cpal::BufferSize::Fixed(256);
-        c
-    };
+    log::info!("audio input device: {}", in_name);
+    log::info!("audio output device: {}", out_name);
 
-    let mut in_stream_config = build_config(&input_config);
-    let mut out_stream_config = build_config(&output_config);
+    let mut input_config: cpal::StreamConfig = input_device
+        .default_input_config()
+        .map_err(|e| ProxaError::AudioInit(e.to_string()))?
+        .into();
+    let mut output_config: cpal::StreamConfig = output_device
+        .default_output_config()
+        .map_err(|e| ProxaError::AudioInit(e.to_string()))?
+        .into();
+    output_config.channels = 2;
 
-    // we assume 1 channel if no client is yet loaded, but callbacks adapt dynamically
-    let client_slot_in = client_slot.clone();
+    input_config.sample_rate = 48000;
+    input_config.buffer_size = cpal::BufferSize::Fixed(256);
+    output_config.sample_rate = 48000;
+    output_config.buffer_size = cpal::BufferSize::Fixed(256);
+
+    let hw_in_channels = input_config.channels as usize;
+    let hw_out_channels = output_config.channels as usize;
+
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-        let guard = client_slot_in.lock();
-        if let Some(client) = guard.as_ref() {
+        let client_opt = {
+            let guard = proxa_client::client::ACTIVE_CLIENT.lock();
+            guard.as_ref().and_then(|w| w.upgrade())
+        };
+
+        if let Some(client) = client_opt {
             let client_channels = if client.get_channels() == opus::Channels::Stereo {
                 2
             } else {
@@ -90,28 +186,16 @@ pub fn start_audio_backend(
         }
     };
 
-    let client_slot_out = client_slot.clone();
     let output_data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-        let guard = client_slot_out.lock();
-        if let Some(client) = guard.as_ref() {
-            let client_channels = if client.get_channels() == opus::Channels::Stereo {
-                2
-            } else {
-                1
-            };
-            if hw_out_channels == client_channels {
+        let client_opt = {
+            let guard = proxa_client::client::ACTIVE_CLIENT.lock();
+            guard.as_ref().and_then(|w| w.upgrade())
+        };
+
+        if let Some(client) = client_opt {
+            if hw_out_channels == 2 {
                 client.pop_audio(data);
-            } else if hw_out_channels > 1 && client_channels == 1 {
-                let frames = data.len() / hw_out_channels;
-                let mut mono = vec![0.0f32; frames];
-                client.pop_audio(&mut mono);
-                for (frame, mono_sample) in data.chunks_exact_mut(hw_out_channels).zip(mono.iter())
-                {
-                    for sample in frame.iter_mut() {
-                        *sample = *mono_sample;
-                    }
-                }
-            } else if hw_out_channels == 1 && client_channels == 2 {
+            } else if hw_out_channels == 1 {
                 let frames = data.len();
                 let mut stereo = vec![0.0f32; frames * 2];
                 client.pop_audio(&mut stereo);
@@ -139,41 +223,40 @@ pub fn start_audio_backend(
 
     let err_fn = |err| log::error!("Audio stream error: {}", err);
 
-    let mut input_stream = input_device.build_input_stream(
-        in_stream_config.clone(),
-        input_data_fn.clone(),
-        err_fn,
-        None,
-    );
-    if input_stream.is_err() {
-        in_stream_config.buffer_size = cpal::BufferSize::Default;
-        input_stream =
-            input_device.build_input_stream(in_stream_config.clone(), input_data_fn, err_fn, None);
+    let mut input_stream_result =
+        input_device.build_input_stream(input_config.clone(), input_data_fn.clone(), err_fn, None);
+    if input_stream_result.is_err() {
+        input_config.buffer_size = cpal::BufferSize::Default;
+        input_stream_result =
+            input_device.build_input_stream(input_config.clone(), input_data_fn, err_fn, None);
     }
-    let input_stream = input_stream.context("Failed to build input stream")?;
+    let input_stream = input_stream_result.map_err(|e| ProxaError::AudioInit(e.to_string()))?;
 
-    let mut output_stream = output_device.build_output_stream(
-        out_stream_config.clone(),
+    let mut output_stream_result = output_device.build_output_stream(
+        output_config.clone(),
         output_data_fn.clone(),
         err_fn,
         None,
     );
-    if output_stream.is_err() {
-        out_stream_config.buffer_size = cpal::BufferSize::Default;
-        output_stream = output_device.build_output_stream(
-            out_stream_config.clone(),
-            output_data_fn,
-            err_fn,
-            None,
-        );
+    if output_stream_result.is_err() {
+        output_config.buffer_size = cpal::BufferSize::Default;
+        output_stream_result =
+            output_device.build_output_stream(output_config.clone(), output_data_fn, err_fn, None);
     }
-    let output_stream = output_stream.context("Failed to build output stream")?;
+    let output_stream = output_stream_result.map_err(|e| ProxaError::AudioInit(e.to_string()))?;
 
-    input_stream.play()?;
-    output_stream.play()?;
+    input_stream
+        .play()
+        .map_err(|e| ProxaError::AudioInit(e.to_string()))?;
+    output_stream
+        .play()
+        .map_err(|e| ProxaError::AudioInit(e.to_string()))?;
 
-    Ok(AudioBackend {
-        _input_stream: input_stream,
-        _output_stream: output_stream,
-    })
+    *guard = Some(AudioBackendState {
+        _streams: (input_stream, output_stream),
+    });
+
+    log::info!("hardware audio backend initialized successfully");
+
+    Ok(())
 }

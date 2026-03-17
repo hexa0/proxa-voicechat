@@ -1,8 +1,9 @@
+use crate::types::OPUS_SAMPLE_RATE;
 use anyhow::Result;
 use std::collections::BTreeMap;
-use crate::types::OPUS_SAMPLE_RATE;
 
 pub struct PeerState {
+    pub channels: opus::Channels,
     pub volume: f32,
     pub decoder: opus::Decoder,
     pub buffer: Vec<f32>,
@@ -18,17 +19,19 @@ pub struct PeerState {
     pub reported_loss_rate: f32,
     pub is_silenced: bool,
     pub awaiting_first_packet: bool,
+    pub last_frame_size: usize,
 }
 
 impl PeerState {
     pub fn new(channels: opus::Channels) -> Result<Self> {
         Ok(Self {
+            channels,
             volume: 0.0,
             decoder: opus::Decoder::new(OPUS_SAMPLE_RATE, channels)?,
             buffer: Vec::new(),
             jitter_buffer: BTreeMap::new(),
             next_decode_seq: 0,
-            target_jitter_frames: 0,
+            target_jitter_frames: 3,
             is_buffering: true,
             total_expected: 0,
             total_lost: 0,
@@ -38,6 +41,7 @@ impl PeerState {
             reported_loss_rate: 0.0,
             is_silenced: true,
             awaiting_first_packet: true,
+            last_frame_size: (OPUS_SAMPLE_RATE as usize * 20) / 1000,
         })
     }
 
@@ -48,6 +52,11 @@ impl PeerState {
         spf: usize,
         _is_stereo: bool,
     ) {
+        let peer_channels = if self.channels == opus::Channels::Stereo {
+            2
+        } else {
+            1
+        };
         let slack_samples = (5 * OPUS_SAMPLE_RATE as usize / 1000) * num_channels;
 
         while self.buffer.len() < pcm_len + slack_samples {
@@ -79,16 +88,22 @@ impl PeerState {
                 }
             }
 
-            let mut decoded = vec![0.0f32; spf];
+            // Opus max frame size is 120ms
+            let max_spf = (OPUS_SAMPLE_RATE as usize * 120 * peer_channels) / 1000;
+            let mut decoded = vec![0.0f32; max_spf];
             let mut valid_decode = false;
 
             if !self.is_buffering {
                 self.total_expected += 1;
                 self.stat_expected += 1;
                 let newest_seq = self.jitter_buffer.keys().next_back().cloned();
-                let current_window = newest_seq.map_or(0, |max| max.saturating_sub(self.next_decode_seq) as usize);
+                let current_window =
+                    newest_seq.map_or(0, |max| max.saturating_sub(self.next_decode_seq) as usize);
 
-                if !self.is_silenced && newest_seq.is_some() && newest_seq.unwrap() > self.next_decode_seq + 5 {
+                if !self.is_silenced
+                    && newest_seq.is_some()
+                    && newest_seq.unwrap() > self.next_decode_seq + 20
+                {
                     if let Some(&first_seq) = self.jitter_buffer.keys().next() {
                         self.next_decode_seq = first_seq;
                     }
@@ -101,7 +116,7 @@ impl PeerState {
                     && self.jitter_buffer.contains_key(&self.next_decode_seq)
                     && self.jitter_buffer.contains_key(&(self.next_decode_seq + 1))
                 {
-                    if let Some(dec) = self.decode_crossfade(spf, num_channels) {
+                    if let Some(dec) = self.decode_crossfade(self.last_frame_size, peer_channels) {
                         decoded = dec;
                         valid_decode = true;
                         fast_forwarded = true;
@@ -116,13 +131,15 @@ impl PeerState {
                     if let Some(payload) = self.jitter_buffer.remove(&self.next_decode_seq) {
                         if let Ok(len) = self.decoder.decode_float(&payload, &mut decoded, false) {
                             valid_decode = true;
-                            decoded.truncate(len * num_channels);
+                            decoded.truncate(len * peer_channels);
+                            self.last_frame_size = len;
                         }
                         self.next_decode_seq += 1;
                         self.good_frames += 1;
                     } else {
                         self.good_frames = self.good_frames.saturating_sub(5);
-                        if let Some(dec) = self.decode_plc_fec(num_channels, spf) {
+                        if let Some(dec) = self.decode_plc_fec(peer_channels, self.last_frame_size)
+                        {
                             decoded = dec;
                             valid_decode = true;
                         }
@@ -147,7 +164,26 @@ impl PeerState {
                     sum_sq += sample * sample;
                 }
                 self.volume = (sum_sq / decoded.len() as f32).sqrt();
-                self.buffer.extend_from_slice(&decoded);
+
+                // channel conversion
+                let converted = if peer_channels == 1 && num_channels == 2 {
+                    let mut v = Vec::with_capacity(decoded.len() * 2);
+                    for &s in &decoded {
+                        v.push(s);
+                        v.push(s);
+                    }
+                    v
+                } else if peer_channels == 2 && num_channels == 1 {
+                    let mut v = Vec::with_capacity(decoded.len() / 2);
+                    for chunk in decoded.chunks_exact(2) {
+                        v.push((chunk[0] + chunk[1]) / 2.0);
+                    }
+                    v
+                } else {
+                    decoded
+                };
+
+                self.buffer.extend_from_slice(&converted);
             } else if self.is_buffering || self.buffer.is_empty() {
                 self.volume = 0.0;
                 self.buffer.extend(std::iter::repeat(0.0).take(spf));
@@ -190,7 +226,10 @@ impl PeerState {
 
         if fec_available {
             let payload_n_plus_1 = self.jitter_buffer.get(&(self.next_decode_seq + 1)).unwrap();
-            if let Ok(len) = self.decoder.decode_float(payload_n_plus_1, &mut decoded, true) {
+            if let Ok(len) = self
+                .decoder
+                .decode_float(payload_n_plus_1, &mut decoded, true)
+            {
                 decoded.truncate(len * num_channels);
                 return Some(decoded);
             }
@@ -198,9 +237,13 @@ impl PeerState {
             if let Ok(len) = self.decoder.decode_float(&[], &mut decoded, false) {
                 decoded.truncate(len * num_channels);
                 if !self.is_silenced {
-                    self.target_jitter_frames = self.target_jitter_frames.saturating_add(1).min(1000);
+                    self.target_jitter_frames =
+                        self.target_jitter_frames.saturating_add(1).min(1000);
                 }
-                if self.jitter_buffer.is_empty() && self.target_jitter_frames > 0 && !self.is_silenced {
+                if self.jitter_buffer.is_empty()
+                    && self.target_jitter_frames > 0
+                    && !self.is_silenced
+                {
                     self.is_buffering = true;
                 }
                 return Some(decoded);

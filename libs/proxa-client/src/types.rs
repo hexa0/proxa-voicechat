@@ -20,3 +20,16 @@ impl DenoiseMethod {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceState {
+    Waiting,
+    Speaking,
+    Silenced,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct AudioDevice {
+    pub name: String,
+    pub id: String,
+}
