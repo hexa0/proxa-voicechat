@@ -2,8 +2,10 @@ use anyhow::Result;
 use dashmap::DashMap;
 use proxa_protocol::{ClientAudioPacket, ClientMessage, ServerAudioPacket, ServerMessage};
 use quinn::{Connection, Endpoint, SendStream, ServerConfig};
-use std::sync::atomic::{AtomicU32, Ordering};
+use rand::RngCore;
+use rand::seq::SliceRandom;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const MAX_CONTROL_MESSAGE_SIZE: usize = 65536;
 const MAX_AUDIO_PACKET_SIZE: usize = 1200;
@@ -33,32 +35,50 @@ pub struct RelayConfig {
 struct AppState {
     rooms: DashMap<String, Arc<Room>>,
     next_peer_id: AtomicU32,
+    id_mask: u32,
+    id_perm: [u8; 32],
+}
+
+impl AppState {
+    fn scramble_id(&self, id: u32) -> u32 {
+        // XOR with a random constant
+        let xored = id ^ self.id_mask;
+
+        // Bit-permutation (swap bits to specific random indices)
+        let mut result = 0u32;
+        for i in 0..32 {
+            if (xored >> i) & 1 == 1 {
+                result |= 1 << self.id_perm[i];
+            }
+        }
+        result
+    }
 }
 
 pub async fn start_relay_server(config: RelayConfig) -> Result<()> {
-    let (cert_chain, key) = if let (Some(cert_p), Some(key_p)) = (&config.cert_path, &config.key_path) {
-        log::info!("loading SSL certificate from {:?} and {:?}", cert_p, key_p);
-        let cert_file = std::fs::File::open(cert_p)?;
-        let mut cert_reader = std::io::BufReader::new(cert_file);
-        let certs = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<Result<Vec<_>, _>>()?;
+    let (cert_chain, key) =
+        if let (Some(cert_p), Some(key_p)) = (&config.cert_path, &config.key_path) {
+            log::info!("loading SSL certificate from {:?} and {:?}", cert_p, key_p);
+            let cert_file = std::fs::File::open(cert_p)?;
+            let mut cert_reader = std::io::BufReader::new(cert_file);
+            let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
 
-        let key_file = std::fs::File::open(key_p)?;
-        let mut key_reader = std::io::BufReader::new(key_file);
-        let key = rustls_pemfile::private_key(&mut key_reader)?
-            .ok_or_else(|| anyhow::anyhow!("no private key found in {:?}", key_p))?;
+            let key_file = std::fs::File::open(key_p)?;
+            let mut key_reader = std::io::BufReader::new(key_file);
+            let key = rustls_pemfile::private_key(&mut key_reader)?
+                .ok_or_else(|| anyhow::anyhow!("no private key found in {:?}", key_p))?;
 
-        (certs, key)
-    } else {
-        log::info!("generating self-signed certificate for localhost...");
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-        let cert_der = cert.cert.der().to_vec();
-        let priv_key = cert.signing_key.serialize_der();
+            (certs, key)
+        } else {
+            log::info!("generating self-signed certificate for localhost...");
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+            let cert_der = cert.cert.der().to_vec();
+            let priv_key = cert.signing_key.serialize_der();
 
-        let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
-        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(priv_key).into();
-        (cert_chain, key)
-    };
+            let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
+            let key = rustls::pki_types::PrivatePkcs8KeyDer::from(priv_key).into();
+            (cert_chain, key)
+        };
 
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -76,16 +96,25 @@ pub async fn start_relay_server(config: RelayConfig) -> Result<()> {
     let endpoint = Endpoint::server(server_config, bind_addr.parse()?)?;
     log::info!("proxa Relay listening on {}...", bind_addr);
 
+    let mut rng = rand::thread_rng();
+    let id_mask = rng.next_u32();
+    let mut id_perm: Vec<u8> = (0..32u8).collect();
+    id_perm.shuffle(&mut rng);
+    let id_perm: [u8; 32] = id_perm.try_into().unwrap();
+
     let state = Arc::new(AppState {
         rooms: DashMap::new(),
         next_peer_id: AtomicU32::new(1),
+        id_mask,
+        id_perm,
     });
 
     while let Some(incoming) = endpoint.accept().await {
         let state = state.clone();
         tokio::spawn(async move {
             if let Ok(connection) = incoming.await {
-                let peer_id = state.next_peer_id.fetch_add(1, Ordering::Relaxed);
+                let raw_id = state.next_peer_id.fetch_add(1, Ordering::Relaxed);
+                let peer_id = state.scramble_id(raw_id);
                 if let Err(e) = handle_connection(connection, peer_id, state).await {
                     log::error!("connection {} error: {}", peer_id, e);
                 }
@@ -124,7 +153,10 @@ async fn handle_connection(
     let client_msg: ClientMessage = bincode::deserialize(&msg_buf)?;
 
     let (room_name, initial_channels) = match client_msg {
-        ClientMessage::JoinRoom { room_name, channels } => (room_name, channels),
+        ClientMessage::JoinRoom {
+            room_name,
+            channels,
+        } => (room_name, channels),
         _ => anyhow::bail!("expected JoinRoom message"),
     };
 
@@ -140,14 +172,29 @@ async fn handle_connection(
 
     log::info!("peer {} joined room {}", peer_id, room_name);
 
-    notify_peer(&ctrl_send, &ServerMessage::RoomJoined { peer_id, channels: initial_channels }).await;
+    notify_peer(
+        &ctrl_send,
+        &ServerMessage::RoomJoined {
+            peer_id,
+            channels: initial_channels,
+        },
+    )
+    .await;
 
     // notify newcomer about existing peers and their silence state
     for entry in room.peers.iter() {
         let other_id = *entry.key();
-        let (_other_conn, other_ctrl, _other_loss_map, other_silenced, other_channels) = entry.value();
+        let (_other_conn, other_ctrl, _other_loss_map, other_silenced, other_channels) =
+            entry.value();
 
-        notify_peer(&ctrl_send, &ServerMessage::PeerJoined { peer_id: other_id, channels: *other_channels }).await;
+        notify_peer(
+            &ctrl_send,
+            &ServerMessage::PeerJoined {
+                peer_id: other_id,
+                channels: *other_channels,
+            },
+        )
+        .await;
         if *other_silenced {
             notify_peer(
                 &ctrl_send,
@@ -160,12 +207,25 @@ async fn handle_connection(
         }
 
         // notify existing peer about newcomer
-        notify_peer(other_ctrl, &ServerMessage::PeerJoined { peer_id, channels: initial_channels }).await;
+        notify_peer(
+            other_ctrl,
+            &ServerMessage::PeerJoined {
+                peer_id,
+                channels: initial_channels,
+            },
+        )
+        .await;
     }
 
     room.peers.insert(
         peer_id,
-        (connection.clone(), ctrl_send.clone(), DashMap::new(), true, initial_channels),
+        (
+            connection.clone(),
+            ctrl_send.clone(),
+            DashMap::new(),
+            true,
+            initial_channels,
+        ),
     ); // defaults to silenced
 
     let conn_clone = connection.clone();
@@ -175,13 +235,17 @@ async fn handle_connection(
         let mut bytes_sent_recent = 0usize;
 
         while let Ok(data) = conn_clone.read_datagram().await {
-            // Security: packet size limit
+            // packet size limit
             if data.len() > MAX_AUDIO_PACKET_SIZE {
-                log::warn!("peer {} sent oversized packet ({} bytes), dropping", peer_id, data.len());
+                log::warn!(
+                    "peer {} sent oversized packet ({} bytes), dropping",
+                    peer_id,
+                    data.len()
+                );
                 continue;
             }
 
-            // Rate limiting: bitrate
+            // rate limiting
             let now = std::time::Instant::now();
             if now.duration_since(last_reset).as_secs() >= 1 {
                 bytes_sent_recent = 0;
@@ -219,7 +283,11 @@ async fn handle_connection(
         }
         let len = u32::from_le_bytes(len_buf) as usize;
         if len > MAX_CONTROL_MESSAGE_SIZE {
-            log::warn!("peer {} sent oversized control message: {} bytes", peer_id, len);
+            log::warn!(
+                "peer {} sent oversized control message: {} bytes",
+                peer_id,
+                len
+            );
             break;
         }
         let mut msg_buf = vec![0u8; len];
@@ -289,7 +357,8 @@ async fn handle_connection(
     room.peers.remove(&peer_id);
     for entry in room.peers.iter() {
         let _other_id = *entry.key();
-        let (_other_conn, other_ctrl, other_loss_map, _other_silenced, _other_channels) = entry.value();
+        let (_other_conn, other_ctrl, other_loss_map, _other_silenced, _other_channels) =
+            entry.value();
 
         // remove departing peer from this peer's records
         other_loss_map.remove(&peer_id);

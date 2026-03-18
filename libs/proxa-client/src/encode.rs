@@ -15,6 +15,7 @@ pub struct EncodeState {
     pub channels: opus::Channels,
     pub samples_per_frame: usize,
     pub simulated_outbound_loss: f32,
+    pub simulated_outbound_jitter: f32,
     pub denoise_method: DenoiseMethod,
     pub echo_cancellation_enabled: bool,
     pub rnnoise_state_left: Option<nnnoiseless::DenoiseState<'static>>,
@@ -31,6 +32,8 @@ pub struct EncodeState {
     pub last_voice_time: std::time::Instant,
     pub is_throttled: bool,
     pub actual_loss_perc: i32,
+    pub simulated_jitter_current_delay: f32,
+    pub simulated_jitter_drift: f32,
 }
 
 impl EncodeState {
@@ -252,7 +255,7 @@ impl EncodeState {
                 }
             }
         } else if !self.is_throttled
-            && self.last_voice_time.elapsed() > std::time::Duration::from_millis(100)
+            && self.last_voice_time.elapsed() > std::time::Duration::from_millis(500)
         {
             let low_bitrate = self.target_bitrate.min(SILENCE_BITRATE);
             let _ = self.encoder.set_bitrate(opus::Bitrate::Bits(low_bitrate));
@@ -298,6 +301,18 @@ pub async fn run_encode_task(
         let mut state = encode_state.lock();
         let spf = state.samples_per_frame;
 
+        // update simulated jitter delay (Markov process)
+        if state.simulated_outbound_jitter > 0.0 {
+            // we use a random walk with some damping to simulate network delay variation
+            let jitter = state.simulated_outbound_jitter;
+            let target_drift = (rand::random::<f32>() - 0.5) * jitter * 0.2;
+            state.simulated_jitter_drift = state.simulated_jitter_drift * 0.9 + target_drift;
+            state.simulated_jitter_current_delay = (state.simulated_jitter_current_delay + state.simulated_jitter_drift).clamp(0.0, jitter);
+        } else {
+            state.simulated_jitter_current_delay = 0.0;
+            state.simulated_jitter_drift = 0.0;
+        }
+
         while state.mic_buffer.len() >= spf {
             let mut frame: Vec<f32> = state.mic_buffer.drain(..spf).collect();
 
@@ -316,12 +331,23 @@ pub async fn run_encode_task(
                 continue;
             }
 
+            let jitter = state.simulated_outbound_jitter;
+            let current_delay = state.simulated_jitter_current_delay;
+
             let mut buf = vec![0u8; 1500];
             if let Ok(len) = state.encoder.encode_float(&frame, &mut buf) {
                 buf.truncate(len);
                 let pkt_bytes = proxa_protocol::ClientAudioPacket::serialize(seq, &buf);
                 if let Some(conn) = connection_slot.read().as_ref() {
-                    let _ = conn.send_datagram(pkt_bytes.into());
+                    let conn = conn.clone();
+                    if jitter > 0.0 {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(current_delay as u64)).await;
+                            let _ = conn.send_datagram(pkt_bytes.into());
+                        });
+                    } else {
+                        let _ = conn.send_datagram(pkt_bytes.into());
+                    }
                 }
             }
         }

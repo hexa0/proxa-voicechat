@@ -39,13 +39,18 @@ pub struct ClientState {
     pub channels: opus::Channels,
     pub samples_per_frame: usize,
     pub global_loss_rate: f32,
+    pub mute_output: bool,
     pub report_tx: Option<mpsc::UnboundedSender<ClientMessage>>,
 }
 
 impl ClientState {
     pub fn handle_audio_packet(&mut self, packet: ServerAudioPacket) {
-        if packet.payload.len() > 1200 { // matches MAX_AUDIO_PACKET_SIZE
-            log::warn!("received oversized audio packet from peer {}", packet.peer_id);
+        if packet.payload.len() > 1200 {
+            // matches MAX_AUDIO_PACKET_SIZE
+            log::warn!(
+                "received oversized audio packet from peer {}",
+                packet.peer_id
+            );
             return;
         }
         if let Some(peer) = self.peers.get_mut(&packet.peer_id) {
@@ -57,7 +62,17 @@ impl ClientState {
             }
             if packet.sequence + 1000 >= peer.next_decode_seq {
                 if packet.sequence < peer.next_decode_seq {
-                    peer.target_jitter_frames = (peer.target_jitter_frames + 1).min(50);
+                    // packet arrived after we already performed PLC (Loss Concealment) for it.
+                    // if it was counted as "lost", let's undo that stat as it's just "late" (jitter).
+                    if peer.lost_sequences.remove(&packet.sequence) {
+                        peer.stat_lost = peer.stat_lost.saturating_sub(1);
+                        peer.total_lost = peer.total_lost.saturating_sub(1);
+                    }
+
+                    // for late packets, increment jitter target if we're well into the stream.
+                    if !peer.is_buffering && peer.played_frames_since_silence > 50 {
+                        peer.target_jitter_frames = (peer.target_jitter_frames + 1).min(100);
+                    }
                 }
                 peer.jitter_buffer.insert(packet.sequence, packet.payload);
             }
@@ -100,15 +115,30 @@ impl ClientState {
             ServerMessage::PeerSilence { peer_id, silenced } => {
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     if peer.is_silenced && !silenced {
-                        if peer.jitter_buffer.is_empty() {
-                            peer.is_buffering = true;
-                            peer.awaiting_first_packet = true;
-                            peer.buffer.clear();
-                            let _ = peer.decoder.reset_state();
-                        }
+                        // TOTAL SYNC: start every sentence from a perfect clean state.
+                        peer.is_buffering = true;
+                        peer.awaiting_first_packet = true;
+                        peer.buffer.clear();
+                        peer.jitter_buffer.clear(); // clear all stale packets from previous session
+
+                        // we will snap sequence when the first packet arrives in handle_audio_packet
+                        peer.next_decode_seq = 0;
+                        peer.resample_index = 0.0;
+                        peer.current_rate = 1.0;
+                        peer.target_jitter_frames = 3;
+                        peer.smoothed_current_latency = peer.target_jitter_frames as f32 + 0.5;
+                        peer.was_plc = false;
+
+                        peer.played_frames_since_silence = 0;
+                        peer.good_frames = 0;
+                        peer.stat_expected = 0;
+                        peer.stat_lost = 0;
+
+                        let _ = peer.decoder.reset_state();
                     } else if !peer.is_silenced && silenced {
                         peer.jitter_buffer.clear();
                         peer.awaiting_first_packet = true;
+                        peer.is_buffering = true;
                     }
                     peer.is_silenced = silenced;
                 }
@@ -260,6 +290,7 @@ impl ProxaClient {
             channels: config.channels,
             samples_per_frame,
             global_loss_rate: 0.0,
+            mute_output: false,
             report_tx: Some(report_tx),
         }));
 
@@ -280,6 +311,7 @@ impl ProxaClient {
             channels: config.channels,
             samples_per_frame,
             simulated_outbound_loss: 0.0,
+            simulated_outbound_jitter: 0.0,
             denoise_method: DenoiseMethod::Off,
             echo_cancellation_enabled: false,
             rnnoise_state_left: Some(*nnnoiseless::DenoiseState::new()),
@@ -296,6 +328,8 @@ impl ProxaClient {
             last_voice_time: std::time::Instant::now(),
             is_throttled: true,
             actual_loss_perc: 0,
+            simulated_jitter_current_delay: 0.0,
+            simulated_jitter_drift: 0.0,
         }));
 
         let state_clone = state.clone();
@@ -515,6 +549,13 @@ impl ProxaClient {
         let mut state = self.encode_state.lock();
         state.simulated_outbound_loss = loss_pct.clamp(0.0, 1.0);
     }
+    pub fn set_simulated_outbound_jitter(&self, jitter_ms: f32) {
+        let mut state = self.encode_state.lock();
+        state.simulated_outbound_jitter = jitter_ms.max(0.0);
+    }
+    pub fn set_mute_output(&self, mute: bool) {
+        self.state.lock().mute_output = mute;
+    }
 
     pub fn set_bitrate(&self, bitrate: i32) -> ProxaResult<()> {
         let mut state = self.encode_state.lock();
@@ -641,29 +682,53 @@ impl ProxaClient {
             *sample = 0.0;
         }
         let mut state = self.state.lock();
+        let is_muted = state.mute_output;
         let num_channels = 2; // output is always stereo
-        let spf = (OPUS_SAMPLE_RATE as usize * 20 * num_channels) / 1000;
         let report_tx = state.report_tx.clone();
 
         for (&peer_id, peer) in state.peers.iter_mut() {
-            if peer.is_silenced && peer.jitter_buffer.is_empty() {
+            // refill the buffer using PeerState logic (always called to handle jitter target decay)
+            // ensure we always request an even number of samples to keep L/R alignment
+            let needed_samples = (((pcm.len() as f32 * 1.1) as usize + 8) / 2) * 2;
+            peer.refill_buffer(needed_samples, num_channels, true);
+
+            if peer.is_silenced && peer.jitter_buffer.is_empty() && peer.buffer.is_empty() {
                 continue;
             }
 
-            // refill the buffer using PeerState logic
-            peer.refill_buffer(
-                pcm.len(),
-                num_channels,
-                spf,
-                true, // output is always stereo
-            );
+            let frame_samples = peer.last_frame_size;
+            let pcm_frames = peer.buffer.len() as f32 / (frame_samples as f32 * 2.0);
+            let newest_seq = peer.jitter_buffer.keys().next_back().cloned();
+            let jitter_frames = newest_seq.map_or(0, |max| {
+                max.saturating_add(1).saturating_sub(peer.next_decode_seq)
+            }) as f32;
 
-            let available = peer.buffer.len();
-            let to_read = available.min(pcm.len());
-            for i in 0..to_read {
-                pcm[i] += peer.buffer[i];
+            let current = pcm_frames + jitter_frames;
+
+            // EMA smoothing (0.05 speed) for the current latency measure to avoid phase jumps
+            peer.smoothed_current_latency = peer.smoothed_current_latency * 0.95 + current * 0.05;
+
+            let target = peer.target_jitter_frames as f32 + 0.5;
+            let diff = peer.smoothed_current_latency - target;
+
+            // 2.0 frame dead-zone for voice chat (prevents typical pitch oscillation)
+            // Also, ONLY activate rate control after the session has settled for 1 second.
+            let target_rate = if diff.abs() < 2.0 || peer.played_frames_since_silence < 100 {
+                1.0
+            } else {
+                let p_gain = 0.0005; // Very gentle correction
+                1.0 + (diff * p_gain).clamp(-0.01, 0.01)
+            };
+
+            // ultra-slow EMA smoothing (0.01 speed) for phase stability
+            peer.current_rate = peer.current_rate * 0.99 + target_rate * 0.01;
+
+            // snap to 1.0 if the EMA is very close to perfect to avoid micro-drifts
+            if (peer.current_rate - 1.0).abs() < 0.00005 {
+                peer.current_rate = 1.0;
             }
-            peer.buffer.drain(..to_read);
+
+            peer.pull_samples(pcm, peer.current_rate);
 
             // report metrics if enough samples collected
             if peer.stat_expected >= 50 {
@@ -681,6 +746,13 @@ impl ProxaClient {
                 }
             }
         }
+
+        if is_muted {
+            for sample in pcm.iter_mut() {
+                *sample = 0.0;
+            }
+        }
+
         let _ = self.far_end_tx.send(pcm.to_vec());
     }
 
@@ -689,7 +761,17 @@ impl ProxaClient {
             .lock()
             .peers
             .iter()
-            .map(|(&k, v)| (k, v.volume, v.target_jitter_frames))
+            .map(|(&k, v)| {
+                let frame_samples = v.last_frame_size;
+                let _pcm_frames = v.buffer.len() as f32 / (frame_samples as f32 * 2.0);
+                let newest_seq = v.jitter_buffer.keys().next_back().cloned();
+                let _jitter_frames = newest_seq.map_or(0, |max| {
+                    max.saturating_add(1).saturating_sub(v.next_decode_seq)
+                }) as f32;
+
+                let total_frames = v.smoothed_current_latency.round();
+                (k, v.volume, total_frames as usize)
+            })
             .collect()
     }
 

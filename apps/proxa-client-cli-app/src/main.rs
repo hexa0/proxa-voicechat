@@ -129,7 +129,10 @@ struct Args {
         help = "Number of mic channels (1 or 2)",
         default_value_t = 1
     )]
-    channels: u8,
+    pub channels: u8,
+
+    #[arg(long, help = "Mute audio output (playback)")]
+    pub mute_output: bool,
 }
 
 impl Args {
@@ -174,6 +177,7 @@ async fn main() -> Result<()> {
     let mut initial_room = args.room.clone();
     let mut exit_app = false;
     let mut simulated_outbound_loss: f32 = 0.0;
+    let mut simulated_outbound_jitter: f32 = 0.0;
     let mut denoise_method = proxa_client::DenoiseMethod::Off;
     let mut echo_cancellation_enabled = false;
 
@@ -238,6 +242,8 @@ async fn main() -> Result<()> {
             .expect("bitrate sync failed");
 
         client.set_simulated_outbound_loss(simulated_outbound_loss);
+        client.set_simulated_outbound_jitter(simulated_outbound_jitter);
+        client.set_mute_output(args.mute_output);
         client.set_denoise_method(denoise_method);
         client.set_echo_cancellation_enabled(echo_cancellation_enabled);
 
@@ -285,6 +291,7 @@ async fn main() -> Result<()> {
                             Line::from(vec![Span::raw("e"), Span::raw(" to toggle echo cancellation")]),
                             Line::from(vec![Span::raw("m"), Span::raw(" to toggle mono/stereo")]),
                             Line::from(vec![Span::raw("up/down"), Span::raw(" arrows to adjust simulated outbound packet loss (hold shift for fine control)")]),
+                            Line::from(vec![Span::raw("left/right"), Span::raw(" arrows to adjust simulated outbound jitter (hold shift for fine control)")]),
                             Line::from(""),
                         ];
 
@@ -293,6 +300,8 @@ async fn main() -> Result<()> {
                             Line::from(vec![
                                 Span::raw("simulated outbound packet loss: "),
                                 Span::styled(format!("{:.1}%", simulated_outbound_loss * 100.0), Style::default().fg(if simulated_outbound_loss > 0.3 { Color::Red } else if simulated_outbound_loss > 0.1 { Color::Yellow } else { Color::White })),
+                                Span::raw(" | jitter: "),
+                                Span::styled(format!("{:.1}ms", simulated_outbound_jitter), Style::default().fg(if simulated_outbound_jitter > 100.0 { Color::Red } else if simulated_outbound_jitter > 10.0 { Color::Yellow } else { Color::White })),
                             ]),
                             Line::from(vec![
                                 Span::raw("fec: "),
@@ -316,6 +325,10 @@ async fn main() -> Result<()> {
                                     proxa_client::types::VoiceState::Speaking => Span::styled("[SPEAKING]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                                     proxa_client::types::VoiceState::Waiting => Span::styled("[WAITING]", Style::default().fg(Color::Yellow)),
                                 }
+                            ]),
+                            Line::from(vec![
+                                Span::raw("output: "),
+                                Span::styled(if args.mute_output { "MUTED" } else { "ACTIVE" }, Style::default().fg(if args.mute_output { Color::Red } else { Color::Green })),
                             ]),
                             Line::from(""),
                         ];
@@ -432,6 +445,16 @@ async fn main() -> Result<()> {
                                 let delta = if key.modifiers.contains(KeyModifiers::SHIFT) { 0.01 } else { 0.10 };
                                 simulated_outbound_loss = (simulated_outbound_loss - delta).max(0.0);
                                 client.set_simulated_outbound_loss(simulated_outbound_loss);
+                            }
+                            if key.code == KeyCode::Right {
+                                let delta = if key.modifiers.contains(KeyModifiers::SHIFT) { 1.0 } else { 5.0 };
+                                simulated_outbound_jitter = (simulated_outbound_jitter + delta).min(1000.0);
+                                client.set_simulated_outbound_jitter(simulated_outbound_jitter);
+                            }
+                            if key.code == KeyCode::Left {
+                                let delta = if key.modifiers.contains(KeyModifiers::SHIFT) { 1.0 } else { 20.0 };
+                                simulated_outbound_jitter = (simulated_outbound_jitter - delta).max(0.0);
+                                client.set_simulated_outbound_jitter(simulated_outbound_jitter);
                             }
                         }
                     }
