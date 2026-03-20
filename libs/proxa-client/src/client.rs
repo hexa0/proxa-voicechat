@@ -1,3 +1,4 @@
+use crate::assets::Assets;
 use crate::error::ProxaError;
 use crate::error::Result as ProxaResult;
 use parking_lot::Mutex;
@@ -187,6 +188,10 @@ pub struct ProxaClient {
 
 impl ProxaClient {
 	pub fn new(config: ClientConfig) -> ProxaResult<Arc<Self>> {
+		if let Some(_) = Assets::get("resources/sounds/Error.wav") {
+			log::info!("") // do literally nothing here, this is so the "Assets" struct doesn't get removed by the dead code optimizer or whatever it's called
+		}
+
 		log::info!(
 			"connecting to {} room '{}' (mic: {:?}, frame: {}ms, low_delay: {})",
 			config.server_host,

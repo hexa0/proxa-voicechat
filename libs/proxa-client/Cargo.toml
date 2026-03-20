@@ -24,3 +24,5 @@ ndarray.workspace = true
 rustls-native-certs = "0.8.3"
 thiserror = "2.0.18"
 serde = { version = "1.0.228", features = ["derive"] }
+rust-embed = { workspace = true }
+

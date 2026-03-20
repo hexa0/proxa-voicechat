@@ -35,6 +35,9 @@ tray-icon = "0.21.3"
 # logging
 log = "0.4"
 env_logger = "0.11.9"
+# for embedding resources
+rust-embed = "8.6.0"
+
 
 # for final publishing: cargo build --profile dist
 # for dev we actually use release because the AI audio processing will run like trash in debug
