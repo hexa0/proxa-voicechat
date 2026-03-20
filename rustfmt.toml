@@ -1,0 +1,5 @@
+# because rust wants to be ""special"" and not respect standards
+# this file should've been an extension to configure more advanced options but NO it HAD to be using exclusively this file
+tab_spaces = 4
+max_width = 100
+hard_tabs = true
