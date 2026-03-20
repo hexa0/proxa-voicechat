@@ -1,0 +1,58 @@
+[config]
+skip_core_tasks = true
+
+[tasks.apps]
+workspace = false
+description = "build all apps in the 'apps' directory with separate target folders"
+category = "Build"
+script = ['''
+    for app in ./apps/*; do
+        if [ -d "$app" ]; then
+            app_name=$(basename "$app")
+            if [ -f "$app/Cargo.toml" ]; then
+                echo "----------------------------------------------------"
+                echo "building app: ${app_name}"
+                echo "target: target/${app_name}"
+                echo "----------------------------------------------------"
+                cargo build -p "${app_name}" --target-dir "target/${app_name}"
+            fi
+        fi
+    done
+
+    echo
+    echo "build complete"
+    ''']
+
+[tasks.app]
+workspace = false
+description = "build a specific app from the 'apps' directory (e.g., cargo make app proxa-relay-app)"
+category = "Build"
+script = [
+	'''
+    app_name=$1
+    if [ -z "$app_name" ]; then
+        echo "usage: cargo make app <app-name> [cargo-flags]"
+        exit 1
+    fi
+
+    # Shift removes the first argument (app_name) so $@ contains only the remaining flags
+    shift
+    args=$@
+
+    echo "----------------------------------------------------"
+    echo "building app: ${app_name}"
+    echo "target: target/${app_name}"
+    if [ ! -z "$args" ]; then
+        echo "flags: ${args}"
+    fi
+    echo "----------------------------------------------------"
+
+    cargo build -p "${app_name}" --target-dir "target/${app_name}" ${args}
+
+    echo
+    echo "build complete"
+    ''',
+]
+
+[tasks.default]
+alias = "apps"
