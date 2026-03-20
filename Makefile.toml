@@ -5,54 +5,107 @@ skip_core_tasks = true
 workspace = false
 description = "build all apps in the 'apps' directory with separate target folders"
 category = "Build"
-script_runner = "sh"
-script = ['''
-    for app in ./apps/*; do
-        if [ -d "$app" ]; then
-            app_name=$(basename "$app")
-            if [ -f "$app/Cargo.toml" ]; then
-                echo "----------------------------------------------------"
-                echo "building app: ${app_name}"
-                echo "target: target/${app_name}"
-                echo "----------------------------------------------------"
-                cargo build -p "${app_name}" --target-dir "target/${app_name}"
-            fi
-        fi
-    done
+script_runner = "@rust"
+script = [
+	'''
+    use std::fs;
+    use std::process::Command;
 
-    echo
-    echo "build complete"
-    ''']
+    fn main() {
+        let apps_dir = "./apps";
+        let entries = fs::read_dir(apps_dir).expect("Could not read apps directory");
+
+        for entry in entries {
+            let entry = entry.expect("Error reading entry");
+            let path = entry.path();
+
+            if path.is_dir() {
+                let app_name = path.file_name().unwrap().to_str().unwrap();
+                let cargo_toml = path.join("Cargo.toml");
+
+                if cargo_toml.exists() {
+                    println!("----------------------------------------------------");
+                    println!("building app: {}", app_name);
+                    println!("target: target/{}", app_name);
+                    println!("----------------------------------------------------");
+
+                    let status = Command::new("cargo")
+                        .args(&[
+                            "build",
+                            "-p",
+                            app_name,
+                            "--target-dir",
+                            &format!("target/{}", app_name),
+                        ])
+                        .status()
+                        .expect("Failed to execute cargo build");
+
+                    if !status.success() {
+                        std::process::exit(status.code().unwrap_or(1));
+                    }
+                }
+            }
+        }
+        println!("\nbuild complete");
+    }
+    ''',
+]
 
 [tasks.app]
 workspace = false
 description = "build a specific app from the 'apps' directory (e.g., cargo make app proxa-relay-app)"
 category = "Build"
-script_runner = "sh"
+script_runner = "@rust"
 script = [
 	'''
-    app_name=$1
-    if [ -z "$app_name" ]; then
-        echo "usage: cargo make app <app-name> [cargo-flags]"
-        exit 1
-    fi
+    use std::env;
+    use std::process::Command;
 
-    # Shift removes the first argument (app_name) so $@ contains only the remaining flags
-    shift
-    args=$@
+    fn main() {
+        let args_raw = env::var("CARGO_MAKE_TASK_ARGS").unwrap_or_default();
+        
+        // handle the semicolon delimiter that cargo-make uses
+        let args: Vec<String> = if args_raw.contains(';') {
+            args_raw.split(';').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+        } else {
+            args_raw.split_whitespace().map(|s| s.to_string()).collect()
+        };
 
-    echo "----------------------------------------------------"
-    echo "building app: ${app_name}"
-    echo "target: target/${app_name}"
-    if [ ! -z "$args" ]; then
-        echo "flags: ${args}"
-    fi
-    echo "----------------------------------------------------"
+        if args.is_empty() {
+            println!("usage: cargo make app <app-name> [cargo-flags]");
+            std::process::exit(1);
+        }
 
-    cargo build -p "${app_name}" --target-dir "target/${app_name}" ${args}
+        let app_name = &args[0];
+        let extra_flags = &args[1..];
 
-    echo
-    echo "build complete"
+        println!("----------------------------------------------------");
+        println!("building app: {}", app_name);
+        println!("target: target/{}", app_name);
+        if !extra_flags.is_empty() {
+            println!("flags: {:?}", extra_flags);
+        }
+        println!("----------------------------------------------------");
+
+        let mut cmd = Command::new("cargo");
+        cmd.arg("build")
+           .arg("-p")
+           .arg(app_name)
+           .arg("--target-dir")
+           .arg(format!("target/{}", app_name));
+        
+        if !extra_flags.is_empty() {
+            cmd.args(extra_flags);
+        }
+
+        let status = cmd.status().expect("Failed to execute cargo build");
+
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+
+        println!("\nbuild complete");
+    }
     ''',
 ]
 
