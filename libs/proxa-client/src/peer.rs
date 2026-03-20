@@ -228,11 +228,11 @@ impl PeerState {
 					self.played_frames_since_silence =
 						self.played_frames_since_silence.saturating_add(1).min(1000);
 				}
-				let mut sum_sq = 0.0;
+				let mut max_abs = 0.0f32;
 				for &sample in &decoded {
-					sum_sq += sample * sample;
+					max_abs = max_abs.max(sample.abs());
 				}
-				self.volume = (sum_sq / decoded.len() as f32).sqrt();
+				self.volume = max_abs;
 
 				if self.played_frames_since_silence < 2
 					&& self.buffer.is_empty()

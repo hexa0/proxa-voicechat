@@ -346,6 +346,8 @@ impl ProxaClient {
 			actual_loss_perc: 0,
 			simulated_jitter_current_delay: 0.0,
 			simulated_jitter_drift: 0.0,
+			auto_normalize: false,
+			current_gain: 1.0,
 		}));
 
 		let state_clone = state.clone();
@@ -686,6 +688,16 @@ impl ProxaClient {
 	}
 	pub fn get_echo_cancellation_enabled(&self) -> bool {
 		self.encode_state.lock().echo_cancellation_enabled
+	}
+	pub fn set_auto_normalize(&self, enabled: bool) {
+		let mut state = self.encode_state.lock();
+		state.auto_normalize = enabled;
+		if !enabled {
+			state.current_gain = 1.0;
+		}
+	}
+	pub fn get_auto_normalize(&self) -> bool {
+		self.encode_state.lock().auto_normalize
 	}
 	pub fn get_channels(&self) -> opus::Channels {
 		self.state.lock().channels

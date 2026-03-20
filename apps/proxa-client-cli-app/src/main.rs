@@ -292,6 +292,7 @@ async fn main() -> Result<()> {
 								Line::from(vec![Span::raw("m"), Span::raw(" to toggle mono/stereo")]),
 								Line::from(vec![Span::raw("up/down"), Span::raw(" arrows to adjust simulated outbound packet loss (hold shift for fine control)")]),
 								Line::from(vec![Span::raw("left/right"), Span::raw(" arrows to adjust simulated outbound jitter (hold shift for fine control)")]),
+								Line::from(vec![Span::raw("j"), Span::raw(" to toggle mic audio normalization")]),
 								Line::from(""),
 							];
 
@@ -329,6 +330,8 @@ async fn main() -> Result<()> {
 								Line::from(vec![
 									Span::raw("output: "),
 									Span::styled(if args.mute_output { "MUTED" } else { "ACTIVE" }, Style::default().fg(if args.mute_output { Color::Red } else { Color::Green })),
+									Span::raw(" | mic compresser (AGC): "),
+									Span::styled(if client.get_auto_normalize() { "ON" } else { "OFF" }, Style::default().fg(if client.get_auto_normalize() { Color::Green } else { Color::Red })),
 								]),
 								Line::from(""),
 							];
@@ -383,14 +386,24 @@ async fn main() -> Result<()> {
 										Span::raw("( ) ")
 									};
 
-									let volume_color = if *volume > 0.5 { Color::Red } else if *volume > 0.1 { Color::Yellow } else { Color::Gray };
+									let volume_color = if *volume > 0.8 {
+										Color::Red
+									} else if *volume > 0.3 {
+										Color::Yellow
+									} else {
+										Color::Green
+									};
+
+									let bar_width = 8;
+									let filled = ( (*volume * bar_width as f32).round() as usize).min(bar_width);
+									let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
 
 									peers_items.push(ListItem::new(Line::from(vec![
 										indicator,
 										Span::styled(format!("peer id {}", id), Style::default().add_modifier(Modifier::BOLD)),
-										Span::raw(" (peak volume: "),
-										Span::styled(format!("{:.3}", volume), Style::default().fg(volume_color)),
-										Span::raw(") [jitter buffer: "),
+										Span::raw(" ["),
+										Span::styled(bar, Style::default().fg(volume_color)),
+										Span::raw("] [jitter: "),
 										Span::styled(format!("{} frames", target_jitter), Style::default().fg(Color::Yellow)),
 										Span::raw("]"),
 									])));
@@ -427,6 +440,10 @@ async fn main() -> Result<()> {
 								if key.code == KeyCode::Char('e') {
 									echo_cancellation_enabled = !echo_cancellation_enabled;
 									client.set_echo_cancellation_enabled(echo_cancellation_enabled);
+								}
+								if key.code == KeyCode::Char('j') {
+									let current = client.get_auto_normalize();
+									client.set_auto_normalize(!current);
 								}
 								if key.code == KeyCode::Up {
 									let delta = if key.modifiers.contains(KeyModifiers::SHIFT) { 0.01 } else { 0.10 };

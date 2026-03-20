@@ -34,6 +34,8 @@ pub struct EncodeState {
 	pub actual_loss_perc: i32,
 	pub simulated_jitter_current_delay: f32,
 	pub simulated_jitter_drift: f32,
+	pub auto_normalize: bool,
+	pub current_gain: f32,
 }
 
 impl EncodeState {
@@ -230,15 +232,38 @@ impl EncodeState {
 
 	pub fn handle_vad(
 	&mut self,
-	frame: &[f32],
+	frame: &mut [f32],
 	report_tx: &Option<mpsc::UnboundedSender<ClientMessage>>,
 	) -> bool {
+	let mut max_abs = 0.0f32;
 	let mut sum_sq = 0.0;
-	for &sample in frame {
+	for sample in frame.iter() {
+		let abs = sample.abs();
+		if abs > max_abs { max_abs = abs; }
 		sum_sq += sample * sample;
 	}
 	let vol = (sum_sq / frame.len() as f32).sqrt();
-	self.volume = vol;
+	self.volume = max_abs;
+
+	if self.auto_normalize {
+		let target_peak = 0.8;
+		// only adjust gain when we hear voice activity (to avoid noise floor boost)
+		if max_abs > 0.0001 && vol > VOICE_THRESHOLD {
+			let desired_gain = (target_peak / max_abs).clamp(0.1, 10.0);
+			if desired_gain < self.current_gain {
+				// extremely fast reduction (effectively a compressor attack) to prevent clipping
+				self.current_gain = self.current_gain * 0.2 + desired_gain * 0.8;
+			} else {
+				// extremely slow and steady increase to avoid "pumping" and boosting background noise
+				self.current_gain = self.current_gain * 0.999 + desired_gain * 0.001;
+			}
+		}
+
+		for s in frame {
+			*s = (*s * self.current_gain).clamp(-1.0, 1.0);
+		}
+		self.volume = (max_abs * self.current_gain).min(1.0);
+	}
 
 	if vol > VOICE_THRESHOLD {
 		self.last_voice_time = std::time::Instant::now();
@@ -318,7 +343,7 @@ pub async fn run_encode_task(
 
 		state.process_aec(&mut frame);
 		state.process_denoise(&mut frame, &encode_state_clone);
-		if state.handle_vad(&frame, &report_tx) {
+		if state.handle_vad(&mut frame, &report_tx) {
 			continue;
 		}
 
