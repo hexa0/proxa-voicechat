@@ -1,4 +1,4 @@
-use crate::assets::Assets;
+use crate::assets;
 use crate::error::ProxaError;
 use crate::error::Result as ProxaResult;
 use parking_lot::Mutex;
@@ -35,6 +35,11 @@ pub fn register_audio_backend(backend: Box<dyn AudioBackend>) {
 	*AUDIO_BACKEND_PROVIDER.lock() = Some(backend);
 }
 
+pub struct SfxState {
+	pub pcm: Vec<f32>,
+	pub position: usize,
+}
+
 pub struct ClientState {
 	pub peers: HashMap<u32, PeerState>,
 	pub channels: opus::Channels,
@@ -42,6 +47,7 @@ pub struct ClientState {
 	pub global_loss_rate: f32,
 	pub mute_output: bool,
 	pub report_tx: Option<mpsc::UnboundedSender<ClientMessage>>,
+	pub sfx: Option<SfxState>,
 }
 
 impl ClientState {
@@ -99,10 +105,12 @@ impl ClientState {
 				};
 				if let Ok(peer) = PeerState::new(opus_channels) {
 					self.peers.insert(peer_id, peer);
+					self.play_sfx("sounds/PeerJoin.opus");
 				}
 			}
 			ServerMessage::PeerLeft { peer_id } => {
 				self.peers.remove(&peer_id);
+				self.play_sfx("sounds/PeerLeave.opus");
 			}
 			ServerMessage::TargetLossRate(rate) => {
 				self.global_loss_rate = rate.clamp(0.0, 0.90);
@@ -164,6 +172,12 @@ impl ClientState {
 			_ => {}
 		}
 	}
+
+	pub fn play_sfx(&mut self, path: &str) {
+		if let Some(pcm) = assets::get_sfx_pcm(path) {
+			self.sfx = Some(SfxState { pcm, position: 0 });
+		}
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -188,10 +202,6 @@ pub struct ProxaClient {
 
 impl ProxaClient {
 	pub fn new(config: ClientConfig) -> ProxaResult<Arc<Self>> {
-		if let Some(_) = Assets::get("resources/sounds/Error.wav") {
-			log::info!("") // do literally nothing here, this is so the "Assets" struct doesn't get removed by the dead code optimizer or whatever it's called
-		}
-
 		log::info!(
 			"connecting to {} room '{}' (mic: {:?}, frame: {}ms, low_delay: {})",
 			config.server_host,
@@ -297,6 +307,7 @@ impl ProxaClient {
 			global_loss_rate: 0.0,
 			mute_output: false,
 			report_tx: Some(report_tx),
+			sfx: None,
 		}));
 
 		encoder
@@ -528,6 +539,7 @@ impl ProxaClient {
 					break;
 				} else {
 					log::warn!("connection interrupted. attempting to reconnect...");
+					state_clone.lock().play_sfx("sounds/Error.opus");
 					tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 				}
 			}
@@ -749,6 +761,19 @@ impl ProxaClient {
 						});
 					}
 				}
+			}
+		}
+
+		if let Some(ref mut sfx) = state.sfx {
+			let to_copy = (pcm.len()).min(sfx.pcm.len() - sfx.position);
+			if to_copy > 0 {
+				for i in 0..to_copy {
+					pcm[i] += sfx.pcm[sfx.position + i];
+				}
+				sfx.position += to_copy;
+			}
+			if sfx.position >= sfx.pcm.len() {
+				state.sfx = None;
 			}
 		}
 

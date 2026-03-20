@@ -2287,6 +2287,7 @@ dependencies = [
  "log",
  "ndarray 0.15.6",
  "nnnoiseless",
+ "ogg",
  "opus",
  "parking_lot",
  "proxa-protocol",
