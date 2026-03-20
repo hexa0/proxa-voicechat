@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use crossterm::{
 	cursor,
-	event::{self, Event, KeyCode, KeyModifiers},
+	event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
 	execute, terminal,
 };
 use parking_lot::Mutex;
@@ -409,8 +409,11 @@ async fn main() -> Result<()> {
 					})?;
 
 					if event::poll(Duration::from_millis(0))? {
-							if let Event::Key(key) = event::read()? {
-								if key.code == KeyCode::Char('x') {
+						if let Event::Key(key) = event::read()? {
+							if key.kind != KeyEventKind::Press {
+								continue;
+							}
+							if key.code == KeyCode::Char('x') {
 									break; // break UI loop
 								}
 								if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
