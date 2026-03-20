@@ -395,8 +395,18 @@ async fn main() -> Result<()> {
 									};
 
 									let bar_width = 8;
-									let filled = ( (*volume * bar_width as f32).round() as usize).min(bar_width);
-									let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
+									let total_ticks = ((*volume * bar_width as f32 * 8.0).round() as usize).min(bar_width * 8);
+									let full_blocks = total_ticks / 8;
+									let partial_tick = total_ticks % 8;
+									let partial_char = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"][partial_tick];
+
+									let mut bar = "█".repeat(full_blocks);
+									if bar.chars().count() < bar_width {
+										bar.push_str(partial_char);
+									}
+									while bar.chars().count() < bar_width {
+										bar.push(' ');
+									}
 
 									peers_items.push(ListItem::new(Line::from(vec![
 										indicator,
