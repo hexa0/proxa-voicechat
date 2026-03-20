@@ -109,6 +109,38 @@ pub async fn start_relay_server(config: RelayConfig) -> Result<()> {
 	id_perm,
 	});
 
+	// broadcast periodic pings
+	let broadcast_state = state.clone();
+	tokio::spawn(async move {
+		loop {
+			tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+			for room_entry in broadcast_state.rooms.iter() {
+				let room = room_entry.value();
+				let mut packets = Vec::new();
+
+				// collect all pings first to avoid holding DashMap locks for too long
+				for entry in room.peers.iter() {
+					let peer_id = *entry.key();
+					let (conn, _, _, _, _) = entry.value();
+					let rtt = conn.rtt().as_millis() as u32;
+					packets.push((peer_id, rtt));
+				}
+
+				if packets.is_empty() {
+					continue;
+				}
+
+				// now broadcast all pings to everyone
+				for entry in room.peers.iter() {
+					let (_peer_id, (_, ctrl, _, _, _)) = entry.pair();
+					for (other_id, other_rtt) in &packets {
+						notify_peer(ctrl, &ServerMessage::PeerPing { peer_id: *other_id, ping_ms: *other_rtt }).await;
+					}
+				}
+			}
+		}
+	});
+
 	while let Some(incoming) = endpoint.accept().await {
 	let state = state.clone();
 	tokio::spawn(async move {

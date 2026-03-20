@@ -28,6 +28,7 @@ pub enum ServerMessage {
 	PeerSilence { peer_id: u32, silenced: bool },
 	PeerChannels { peer_id: u32, channels: u8 },
 	TargetLossRate(f32),
+	PeerPing { peer_id: u32, ping_ms: u32 },
 	Error(String),
 }
 

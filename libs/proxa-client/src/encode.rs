@@ -36,6 +36,7 @@ pub struct EncodeState {
 	pub simulated_jitter_drift: f32,
 	pub auto_normalize: bool,
 	pub current_gain: f32,
+	pub total_bytes_sent: u64,
 }
 
 impl EncodeState {
@@ -363,6 +364,7 @@ pub async fn run_encode_task(
 		if let Ok(len) = state.encoder.encode_float(&frame, &mut buf) {
 			buf.truncate(len);
 			let pkt_bytes = proxa_protocol::ClientAudioPacket::serialize(seq, &buf);
+			state.total_bytes_sent += pkt_bytes.len() as u64;
 			if let Some(conn) = connection_slot.read().as_ref() {
 				let conn = conn.clone();
 				if jitter > 0.0 {

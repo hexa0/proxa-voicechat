@@ -8,7 +8,7 @@ use crossterm::{
 use parking_lot::Mutex;
 use proxa_client::ProxaClient;
 use rand::seq::IndexedRandom;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 use std::{
 	io::{self, Write, stdout},
@@ -262,6 +262,8 @@ async fn main() -> Result<()> {
 		&"we've failed to perform a task that is deterministic to pass and as such cannot fail normally, your hardware is likely severly messed up as this should be impossible to trigger without faulty ram, memory corruption, or glitching your CPU",
 	);
 		let mut was_room_last_empty = true;
+		let mut last_peer_bytes: HashMap<u32, (u64, std::time::Instant, f32)> = HashMap::new();
+		let mut last_self_bytes: (u64, std::time::Instant, f32) = (0, std::time::Instant::now(), 0.0);
 
 		// UI refresh loop
 		loop {
@@ -279,6 +281,38 @@ async fn main() -> Result<()> {
 
 					let current_bitrate = client.get_bitrate();
 					let voice_state = client.get_voice_state();
+					let ping = client.get_ping();
+
+					let now = std::time::Instant::now();
+
+					// calculate datarate for peers
+					let mut peer_datarates = HashMap::new();
+					for (id, _, _, total_bytes, _) in &peers {
+						let entry = last_peer_bytes.entry(*id).or_insert((*total_bytes, now, 0.0));
+						let elapsed = now.duration_since(entry.1).as_secs_f32();
+						if elapsed >= 1.0 {
+							let diff = total_bytes.saturating_sub(entry.0);
+							let bps = (diff as f32 * 8.0) / elapsed;
+							entry.0 = *total_bytes;
+							entry.1 = now;
+							entry.2 = bps;
+						}
+						peer_datarates.insert(*id, entry.2);
+					}
+
+					// calculate datarate for self
+					{
+						let total_bytes = client.get_total_bytes_sent();
+						let elapsed = now.duration_since(last_self_bytes.1).as_secs_f32();
+						if elapsed >= 1.0 {
+							let diff = total_bytes.saturating_sub(last_self_bytes.0);
+							let bps = (diff as f32 * 8.0) / elapsed;
+							last_self_bytes.0 = total_bytes;
+							last_self_bytes.1 = now;
+							last_self_bytes.2 = bps;
+						}
+					}
+					let self_datarate = last_self_bytes.2;
 
 
 					terminal.draw(|f| {
@@ -379,7 +413,36 @@ async fn main() -> Result<()> {
 									Span::styled(format!("  {}", empty_room_message), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))
 								])));
 							} else {
-								for (id, volume, target_jitter) in &peers {
+								// display self
+								let self_vol = client.get_local_volume();
+								let indicator = if voice_state == proxa_client::types::VoiceState::Speaking {
+									Span::styled("(*) ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+								} else {
+									Span::raw("( ) ")
+								};
+								let volume_color = if self_vol > 0.8 { Color::Red } else if self_vol > 0.3 { Color::Yellow } else { Color::Green };
+								let bar_width = 8;
+								let total_ticks = ((self_vol * bar_width as f32 * 8.0).round() as usize).min(bar_width * 8);
+								let full_blocks = total_ticks / 8;
+								let partial_tick = total_ticks % 8;
+								let partial_char = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"][partial_tick];
+								let mut bar = "█".repeat(full_blocks);
+								if bar.chars().count() < bar_width { bar.push_str(partial_char); }
+								while bar.chars().count() < bar_width { bar.push(' '); }
+
+								peers_items.push(ListItem::new(Line::from(vec![
+									indicator,
+									Span::styled("you ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+									Span::raw("["),
+									Span::styled(bar, Style::default().fg(volume_color)),
+									Span::raw("] [ping: "),
+									Span::styled(ping.map(|p| format!("{}ms", p.as_millis())).unwrap_or_else(|| "?.?ms".to_string()), Style::default().fg(Color::Gray)),
+									Span::raw("] [rate: "),
+									Span::styled(format!("{:.1} kbps", self_datarate / 1000.0), Style::default().fg(Color::Blue)),
+									Span::raw("]"),
+								])));
+
+								for (id, volume, target_jitter, _total_bytes, peer_ping) in &peers {
 									let indicator = if *volume > proxa_client::VOICE_THRESHOLD {
 										Span::styled("(*) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
 									} else {
@@ -408,11 +471,17 @@ async fn main() -> Result<()> {
 										bar.push(' ');
 									}
 
+									let peer_rate = peer_datarates.get(id).cloned().unwrap_or(0.0);
+
 									peers_items.push(ListItem::new(Line::from(vec![
 										indicator,
-										Span::styled(format!("peer id {}", id), Style::default().add_modifier(Modifier::BOLD)),
+										Span::styled(format!("peer {}", id), Style::default().add_modifier(Modifier::BOLD)),
 										Span::raw(" ["),
 										Span::styled(bar, Style::default().fg(volume_color)),
+										Span::raw("] [ping: "),
+										Span::styled(format!("{}ms", peer_ping), Style::default().fg(Color::Gray)),
+										Span::raw("] [rate: "),
+										Span::styled(format!("{:.1} kbps", peer_rate / 1000.0), Style::default().fg(Color::Blue)),
 										Span::raw("] [jitter: "),
 										Span::styled(format!("{} frames", target_jitter), Style::default().fg(Color::Yellow)),
 										Span::raw("]"),

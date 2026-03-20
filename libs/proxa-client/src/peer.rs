@@ -30,6 +30,8 @@ pub struct PeerState {
 	pub current_rate: f32,
 	pub was_plc: bool,
 	pub smoothed_current_latency: f32,
+	pub total_bytes_received: u64,
+	pub ping: u32,
 }
 
 impl PeerState {
@@ -62,6 +64,8 @@ impl PeerState {
 			current_rate: 1.0,
 			was_plc: false,
 			smoothed_current_latency: 2.0, // Start with a safe assumption
+			total_bytes_received: 0,
+			ping: 0,
 		})
 	}
 

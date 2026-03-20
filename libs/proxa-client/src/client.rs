@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Weak;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -61,6 +62,7 @@ impl ClientState {
 			return;
 		}
 		if let Some(peer) = self.peers.get_mut(&packet.peer_id) {
+			peer.total_bytes_received += packet.payload.len() as u64;
 			if peer.awaiting_first_packet {
 				peer.next_decode_seq = packet.sequence;
 				peer.awaiting_first_packet = false;
@@ -169,6 +171,11 @@ impl ClientState {
 					}
 				}
 			}
+			ServerMessage::PeerPing { peer_id, ping_ms } => {
+				if let Some(peer) = self.peers.get_mut(&peer_id) {
+					peer.ping = ping_ms;
+				}
+			}
 			_ => {}
 		}
 	}
@@ -198,6 +205,7 @@ pub struct ProxaClient {
 	_encode_task: JoinHandle<()>,
 	_network_task: JoinHandle<()>,
 	_disconnect_tx: mpsc::Sender<()>,
+	pub connection_slot: Arc<parking_lot::RwLock<Option<quinn::Connection>>>,
 }
 
 impl ProxaClient {
@@ -348,6 +356,7 @@ impl ProxaClient {
 			simulated_jitter_drift: 0.0,
 			auto_normalize: false,
 			current_gain: 1.0,
+			total_bytes_sent: 0,
 		}));
 
 		let state_clone = state.clone();
@@ -369,7 +378,9 @@ impl ProxaClient {
 			connection_slot.clone(),
 		));
 
+		let connection_slot_task = connection_slot.clone();
 		let _network_task = tokio::spawn(async move {
+			let connection_slot = connection_slot_task;
 			loop {
 				// re-resolve in case of DNS change during runtime or retry loop
 				let host_port = if server_host_owned.contains(':') {
@@ -556,6 +567,7 @@ impl ProxaClient {
 			_encode_task,
 			_network_task,
 			_disconnect_tx: disconnect_tx,
+			connection_slot,
 		});
 
 		*ACTIVE_CLIENT.lock() = Some(Arc::downgrade(&client));
@@ -798,7 +810,7 @@ impl ProxaClient {
 		let _ = self.far_end_tx.send(pcm.to_vec());
 	}
 
-	pub fn get_peer_stats(&self) -> Vec<(u32, f32, usize)> {
+	pub fn get_peer_stats(&self) -> Vec<(u32, f32, usize, u64, u32)> {
 		self.state
 			.lock()
 			.peers
@@ -812,9 +824,17 @@ impl ProxaClient {
 				}) as f32;
 
 				let total_frames = v.smoothed_current_latency.round();
-				(k, v.volume, total_frames as usize)
+				(k, v.volume, total_frames as usize, v.total_bytes_received, v.ping)
 			})
 			.collect()
+	}
+
+	pub fn get_ping(&self) -> Option<Duration> {
+		self.connection_slot.read().as_ref().map(|c| c.rtt())
+	}
+
+	pub fn get_total_bytes_sent(&self) -> u64 {
+		self.encode_state.lock().total_bytes_sent
 	}
 
 	pub fn get_local_volume(&self) -> f32 {
