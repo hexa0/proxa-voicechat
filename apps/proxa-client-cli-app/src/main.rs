@@ -292,7 +292,7 @@ async fn main() -> Result<()> {
 								Line::from(vec![Span::raw("m"), Span::raw(" to toggle mono/stereo")]),
 								Line::from(vec![Span::raw("up/down"), Span::raw(" arrows to adjust simulated outbound packet loss (hold shift for fine control)")]),
 								Line::from(vec![Span::raw("left/right"), Span::raw(" arrows to adjust simulated outbound jitter (hold shift for fine control)")]),
-								Line::from(vec![Span::raw("j"), Span::raw(" to toggle mic audio normalization")]),
+								Line::from(vec![Span::raw("j"), Span::raw(" to toggle mic compresser (AGC)")]),
 								Line::from(""),
 							];
 
