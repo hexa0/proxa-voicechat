@@ -5,6 +5,7 @@ skip_core_tasks = true
 workspace = false
 description = "build all apps in the 'apps' directory with separate target folders"
 category = "Build"
+script_runner = "sh"
 script = ['''
     for app in ./apps/*; do
         if [ -d "$app" ]; then
@@ -27,6 +28,7 @@ script = ['''
 workspace = false
 description = "build a specific app from the 'apps' directory (e.g., cargo make app proxa-relay-app)"
 category = "Build"
+script_runner = "sh"
 script = [
 	'''
     app_name=$1
