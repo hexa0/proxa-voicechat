@@ -521,27 +521,27 @@ impl ProxaClient {
 							let _ = ctrl_send.write_all(&msg_bytes).await;
 						}
 						datagram = conn_clone.read_datagram() => {
-						match datagram {
-							Ok(data) => {
-								if let Some(packet) = ServerAudioPacket::deserialize(&data) {
-									state_clone.lock().handle_audio_packet(packet);
+							match datagram {
+								Ok(data) => {
+									if let Some(packet) = ServerAudioPacket::deserialize(&data) {
+										state_clone.lock().handle_audio_packet(packet);
+									}
 								}
+								Err(_) => break,
 							}
-							Err(_) => break,
-						}
 						}
 						res = ctrl_recv.read_exact(&mut len_buf) => {
 						if res.is_err() { break; }
-						let len = u32::from_le_bytes(len_buf) as usize;
-						if len > 65536 { // matches MAX_CONTROL_MESSAGE_SIZE
-							log::warn!("server sent oversized control message: {} bytes", len);
-							break;
-						}
-						let mut msg_buf = vec![0u8; len];
-						if ctrl_recv.read_exact(&mut msg_buf).await.is_err() { break; }
-						if let Ok(msg) = bincode::deserialize::<ServerMessage>(&msg_buf) {
-							state_clone.lock().handle_server_message(msg, &encode_state_clone);
-						}
+							let len = u32::from_le_bytes(len_buf) as usize;
+							if len > 65536 { // matches MAX_CONTROL_MESSAGE_SIZE
+								log::warn!("server sent oversized control message: {} bytes", len);
+								break;
+							}
+							let mut msg_buf = vec![0u8; len];
+							if ctrl_recv.read_exact(&mut msg_buf).await.is_err() { break; }
+							if let Ok(msg) = bincode::deserialize::<ServerMessage>(&msg_buf) {
+								state_clone.lock().handle_server_message(msg, &encode_state_clone);
+							}
 						}
 					}
 				}
