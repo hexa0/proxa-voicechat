@@ -824,7 +824,13 @@ impl ProxaClient {
 				}) as f32;
 
 				let total_frames = v.smoothed_current_latency.round();
-				(k, v.volume, total_frames as usize, v.total_bytes_received, v.ping)
+				(
+					k,
+					v.volume,
+					total_frames as usize,
+					v.total_bytes_received,
+					v.ping,
+				)
 			})
 			.collect()
 	}
