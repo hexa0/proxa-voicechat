@@ -137,12 +137,9 @@ pub fn init() -> ProxaResult<()> {
 		.default_output_config()
 		.map_err(|e| ProxaError::AudioInit(e.to_string()))?
 		.into();
-	output_config.channels = 2;
 
-	input_config.sample_rate = 48000;
-	input_config.buffer_size = cpal::BufferSize::Fixed(256);
-	output_config.sample_rate = 48000;
-	output_config.buffer_size = cpal::BufferSize::Fixed(256);
+	let in_rate = input_config.sample_rate;
+	let out_rate = output_config.sample_rate;
 
 	let hw_in_channels = input_config.channels as usize;
 	let hw_out_channels = output_config.channels as usize;
@@ -160,10 +157,10 @@ pub fn init() -> ProxaResult<()> {
 				1
 			};
 			if hw_in_channels == client_channels {
-				client.push_audio(data);
+				client.push_audio(data, in_rate);
 			} else if hw_in_channels == 1 && client_channels == 2 {
 				let stereo: Vec<f32> = data.iter().flat_map(|&s| vec![s, s]).collect();
-				client.push_audio(&stereo);
+				client.push_audio(&stereo, in_rate);
 			} else if hw_in_channels > 1 && client_channels == 1 {
 				let mono: Vec<f32> = data
 					.chunks_exact(hw_in_channels)
@@ -175,13 +172,13 @@ pub fn init() -> ProxaResult<()> {
 						sum / hw_in_channels as f32
 					})
 					.collect();
-				client.push_audio(&mono);
+				client.push_audio(&mono, in_rate);
 			} else {
 				let stereo: Vec<f32> = data
 					.chunks_exact(hw_in_channels)
 					.flat_map(|c| vec![c[0], c[1.min(hw_in_channels - 1)]])
 					.collect();
-				client.push_audio(&stereo);
+				client.push_audio(&stereo, in_rate);
 			}
 		}
 	};
@@ -194,23 +191,23 @@ pub fn init() -> ProxaResult<()> {
 
 		if let Some(client) = client_opt {
 			if hw_out_channels == 2 {
-				client.pop_audio(data);
+				client.pop_audio(data, out_rate);
 			} else if hw_out_channels == 1 {
 				let frames = data.len();
 				let mut stereo = vec![0.0f32; frames * 2];
-				client.pop_audio(&mut stereo);
+				client.pop_audio(&mut stereo, out_rate);
 				for (i, frame) in stereo.chunks_exact(2).enumerate() {
 					data[i] = (frame[0] + frame[1]) / 2.0;
 				}
 			} else {
 				let frames = data.len() / hw_out_channels;
 				let mut stereo = vec![0.0f32; frames * 2];
-				client.pop_audio(&mut stereo);
+				client.pop_audio(&mut stereo, out_rate);
 				for (i, frame) in data.chunks_exact_mut(hw_out_channels).enumerate() {
-					frame[0] = stereo[i * 2];
-					frame[1] = stereo[i * 2 + 1];
-					for j in 2..hw_out_channels {
-						frame[j] = 0.0;
+					let l = stereo[i * 2];
+					let r = stereo[i * 2 + 1];
+					for j in 0..hw_out_channels {
+						frame[j] = if j % 2 == 0 { l } else { r };
 					}
 				}
 			}

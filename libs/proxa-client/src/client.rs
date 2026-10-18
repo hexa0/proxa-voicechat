@@ -20,6 +20,10 @@ use crate::encode::{EncodeState, run_encode_task};
 use crate::peer::PeerState;
 use crate::types::{AudioDevice, DenoiseMethod, OPUS_SAMPLE_RATE, SILENCE_BITRATE};
 
+use rubato::Resampler;
+
+pub const INTERNAL_BLOCK_SIZE: usize = 256;
+
 pub trait AudioBackend: Send + Sync {
 	fn enumerate_input_devices(&self) -> Vec<AudioDevice>;
 	fn enumerate_output_devices(&self) -> Vec<AudioDevice>;
@@ -206,6 +210,11 @@ pub struct ProxaClient {
 	_network_task: JoinHandle<()>,
 	_disconnect_tx: mpsc::Sender<()>,
 	pub connection_slot: Arc<parking_lot::RwLock<Option<quinn::Connection>>>,
+
+	output_resampler: Mutex<Option<(u32, rubato::SincFixedIn<f32>)>>,
+	input_resampler: Mutex<Option<(u32, rubato::SincFixedIn<f32>)>>,
+	render_buffer_48k: Mutex<Vec<f32>>,
+	input_hardware_buffer: Mutex<Vec<f32>>,
 }
 
 impl ProxaClient {
@@ -568,6 +577,10 @@ impl ProxaClient {
 			_network_task,
 			_disconnect_tx: disconnect_tx,
 			connection_slot,
+			output_resampler: Mutex::new(None),
+			input_resampler: Mutex::new(None),
+			render_buffer_48k: Mutex::new(Vec::new()),
+			input_hardware_buffer: Mutex::new(Vec::new()),
 		});
 
 		*ACTIVE_CLIENT.lock() = Some(Arc::downgrade(&client));
@@ -714,11 +727,153 @@ impl ProxaClient {
 	pub fn get_channels(&self) -> opus::Channels {
 		self.state.lock().channels
 	}
-	pub fn push_audio(&self, pcm: &[f32]) {
-		let _ = self.mic_tx.send(pcm.to_vec());
+	pub fn push_audio(&self, pcm: &[f32], hw_rate: u32) {
+		if hw_rate == OPUS_SAMPLE_RATE {
+			let _ = self.mic_tx.send(pcm.to_vec());
+			return;
+		}
+
+		let mut input_resampler_guard = self.input_resampler.lock();
+		let initialize = if let Some((rate, _)) = &*input_resampler_guard {
+			*rate != hw_rate
+		} else {
+			true
+		};
+
+		if initialize {
+			// for input we assume 1 or 2 channels, the backend should have told us
+			// but for simplicity we assume the incoming pcm matches our ProxaClient::channels
+			let channels = if self.get_channels() == opus::Channels::Stereo {
+				2
+			} else {
+				1
+			};
+			if let Ok(resampler) = rubato::SincFixedIn::<f32>::new(
+				OPUS_SAMPLE_RATE as f64 / hw_rate as f64,
+				2.0,
+				rubato::SincInterpolationParameters {
+					sinc_len: 128,
+					f_cutoff: 0.95,
+					interpolation: rubato::SincInterpolationType::Linear,
+					oversampling_factor: 128,
+					window: rubato::WindowFunction::BlackmanHarris2,
+				},
+				pcm.len() / channels,
+				channels,
+			) {
+				*input_resampler_guard = Some((hw_rate, resampler));
+			}
+		}
+
+		if let Some((_, resampler)) = &mut *input_resampler_guard {
+			let mut hw_buf = self.input_hardware_buffer.lock();
+			hw_buf.extend_from_slice(pcm);
+
+			let channels = resampler.nbr_channels();
+			while hw_buf.len() >= resampler.input_frames_next() * channels {
+				let needed_frames = resampler.input_frames_next();
+				let mut audio_in = vec![vec![0.0f32; needed_frames]; channels];
+				for ch in 0..channels {
+					for f in 0..needed_frames {
+						audio_in[ch][f] = hw_buf[f * channels + ch];
+					}
+				}
+				hw_buf.drain(0..needed_frames * channels);
+
+				if let Ok(resampled) = resampler.process(&audio_in, None) {
+					let out_frames = resampled[0].len();
+					let mut out_pcm = vec![0.0f32; out_frames * channels];
+					for ch in 0..channels {
+						for f in 0..out_frames {
+							out_pcm[f * channels + ch] = resampled[ch][f];
+						}
+					}
+					let _ = self.mic_tx.send(out_pcm);
+				} else {
+					break;
+				}
+			}
+		}
 	}
 
-	pub fn pop_audio(&self, pcm: &mut [f32]) {
+	pub fn pop_audio(&self, pcm: &mut [f32], hw_rate: u32) {
+		if hw_rate == OPUS_SAMPLE_RATE {
+			self.pop_audio_internal(pcm);
+			return;
+		}
+
+		let mut output_resampler_guard = self.output_resampler.lock();
+		let initialize = if let Some((rate, _)) = &*output_resampler_guard {
+			*rate != hw_rate
+		} else {
+			true
+		};
+
+		if initialize {
+			let channels = 2; // output is always stereo in Proxa
+			if let Ok(resampler) = rubato::SincFixedIn::<f32>::new(
+				hw_rate as f64 / OPUS_SAMPLE_RATE as f64,
+				2.0,
+				rubato::SincInterpolationParameters {
+					sinc_len: 128,
+					f_cutoff: 0.95,
+					interpolation: rubato::SincInterpolationType::Linear,
+					oversampling_factor: 128,
+					window: rubato::WindowFunction::BlackmanHarris2,
+				},
+				INTERNAL_BLOCK_SIZE,
+				channels,
+			) {
+				*output_resampler_guard = Some((hw_rate, resampler));
+			}
+		}
+
+		if let Some((_, resampler)) = &mut *output_resampler_guard {
+			let mut render_buf = self.render_buffer_48k.lock();
+			let channels = 2;
+
+			let mut out_idx = 0;
+			while out_idx < pcm.len() {
+				// rubato SincFixedIn needs a specific amount of input per process call
+				let needed_frames = resampler.input_frames_next();
+				if render_buf.len() < needed_frames * channels {
+					let mut frame_48k = vec![0.0f32; INTERNAL_BLOCK_SIZE * channels];
+					self.pop_audio_internal(&mut frame_48k);
+					render_buf.extend_from_slice(&frame_48k);
+				}
+
+				if render_buf.len() >= needed_frames * channels {
+					let mut input_chunk = vec![vec![0.0f32; needed_frames]; channels];
+					for ch in 0..channels {
+						for f in 0..needed_frames {
+							input_chunk[ch][f] = render_buf[f * channels + ch];
+						}
+					}
+					render_buf.drain(0..needed_frames * channels);
+
+					if let Ok(resampled) = resampler.process(&input_chunk, None) {
+						let res_frames = resampled[0].len();
+						for f in 0..res_frames {
+							if out_idx < pcm.len() {
+								pcm[out_idx] = resampled[0][f];
+								pcm[out_idx + 1] = resampled[1][f];
+								out_idx += 2;
+							}
+						}
+					} else {
+						break;
+					}
+				} else {
+					break; // should not happen given the logic above
+				}
+			}
+		} else {
+			// fallback if resampler failed to init
+			self.pop_audio_internal(pcm);
+		}
+	}
+
+	fn pop_audio_internal(&self, pcm: &mut [f32]) {
 		for sample in pcm.iter_mut() {
 			*sample = 0.0;
 		}
